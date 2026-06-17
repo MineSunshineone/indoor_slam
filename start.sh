@@ -45,7 +45,7 @@ tmux send-keys -t $SESSION:0.0 "export ROS_DOMAIN_ID=37 && source install/setup.
 sleep 2
 
 # 2号窗格 (左下): 里程计 (Point-LIO)
-tmux send-keys -t $SESSION:0.2 "export ROS_DOMAIN_ID=37 && source install/setup.bash && ros2 launch point_lio point_lio.launch.py" C-m
+tmux send-keys -t $SESSION:0.2 "export ROS_DOMAIN_ID=37 && source install/setup.bash && ros2 launch point_lio point_lio_with_mapping_control.launch.py" C-m
 sleep 2
 
 # 1号窗格 (右上): 重定位 (small_gicp)

@@ -66,7 +66,7 @@ source install/setup.bash
 | 窗格 | 模块 | 命令 |
 | --- | --- | --- |
 | 左上 | 雷达驱动 | `ros2 launch livox_ros_driver2 msg_MID360s_launch.py` |
-| 左下 | Point-LIO | `ros2 launch point_lio point_lio.launch.py` |
+| 左下 | Point-LIO + 建图控制 | `ros2 launch point_lio point_lio_with_mapping_control.launch.py` |
 | 右上 | 重定位 | `ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py` |
 | 右下 | 导航 | `ros2 launch nav indoor_navigation_launch.py` |
 
@@ -108,6 +108,14 @@ ros2 launch livox_ros_driver2 msg_MID360s_launch.py
 export ROS_DOMAIN_ID=37
 source install/setup.bash
 ros2 launch point_lio point_lio.launch.py
+```
+
+如果需要同时启动 App 建图控制接口，使用：
+
+```bash
+export ROS_DOMAIN_ID=37
+source install/setup.bash
+ros2 launch point_lio point_lio_with_mapping_control.launch.py
 ```
 
 终端 3，重定位：
