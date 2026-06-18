@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""面向 App 对接的 HTTP + ROS 2 建图控制节点。
+"""面向 App 对接的 ROS 2 建图控制节点。
 
 该节点订阅 Point-LIO 发布的配准点云，并增量生成 Nav2 风格的 2D 栅格地图。
-App 通过 HTTP 接口控制地图累积流程：开始、暂停/继续、取消、保存、查询状态。
+App 通过 ROS 2 action/service/topic 控制地图累积流程：开始、暂停/继续、取消、保存、查询状态。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,7 +22,6 @@ import numpy as np
 
 # 地图名会直接用于生成文件名，只允许安全字符，避免路径穿越和奇怪文件名。
 MAP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
 
 def sanitize_map_name(map_name: str) -> str:
     # 清理并校验地图名，确保后续可以安全拼成 .pgm/.yaml 文件路径。
@@ -145,16 +145,20 @@ class MappingSession:
 
     def status(self) -> dict[str, Any]:
         # 返回给 App 的状态字段保持简单稳定，便于前端直接展示。
-        return {
-            "state": self.state,
-            "current_map_name": self.current_map_name,
-            "map_pgm_path": str(self._pgm_path()) if self.current_map_name else "",
-            "map_yaml_path": str(self._yaml_path()) if self.current_map_name else "",
-            "resolution": self.config.resolution,
-            "width": self.width,
-            "height": self.height,
-            "last_error": self.last_error,
-        }
+        with self.lock:
+            cells_known, coverage_percent = self._grid_metrics()
+            return {
+                "state": self.state,
+                "current_map_name": self.current_map_name,
+                "map_pgm_path": str(self._pgm_path()) if self.current_map_name else "",
+                "map_yaml_path": str(self._yaml_path()) if self.current_map_name else "",
+                "cells_known": cells_known,
+                "coverage_percent": coverage_percent,
+                "resolution": self.config.resolution,
+                "width": self.width,
+                "height": self.height,
+                "last_error": self.last_error,
+            }
 
     def _clear_counts(self) -> None:
         # 只清空累积证据，不改变地图参数。
@@ -183,6 +187,14 @@ class MappingSession:
             occ = expanded
         grid[occ] = 0
         return grid
+
+    def _grid_metrics(self) -> tuple[int, float]:
+        # 统计最终栅格中已知区域比例，和保存出来的 PGM 语义保持一致。
+        grid = self._build_grid()
+        cells_known = int(np.count_nonzero(grid != 205))
+        total_cells = self.width * self.height
+        coverage_percent = (cells_known / total_cells * 100.0) if total_cells else 0.0
+        return cells_known, round(float(coverage_percent), 2)
 
     def _write_pgm(self, pgm_path: Path, grid: np.ndarray) -> None:
         # ROS 地图原点在左下角，而 PGM 图像原点在左上角，因此写入前上下翻转。
@@ -239,7 +251,7 @@ class MappingRequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/mapping/pause":
                 result = self.server.session.pause(bool(body.get("paused", True)))
             elif self.path == "/mapping/cancel":
-                result = self.server.sessio  .cancel()
+                result = self.server.session.cancel()
             elif self.path == "/mapping/save":
                 map_name = body.get("map_name")
                 result = self.server.session.save(str(map_name) if map_name is not None else None)
@@ -285,38 +297,224 @@ def run_http_server(session: MappingSession, host: str, port: int) -> MappingHtt
 def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
     # ROS 相关依赖只在实际启动 ROS 模式时导入，便于单元测试直接加载纯逻辑。
     import rclpy
+    from bxi_nav_interfaces.action import BuildMap
+    from bxi_nav_interfaces.msg import MappingStatus
+    from bxi_nav_interfaces.srv import SaveMap
+    from rclpy.action import ActionServer, CancelResponse, GoalResponse
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
+    from std_srvs.srv import SetBool
 
     class MappingControlNode(Node):
-        """订阅 Point-LIO 点云，并把点云数据送入 MappingSession。"""
+        """订阅 Point-LIO 点云，并提供 App 建图 action/service/topic。"""
 
         def __init__(self) -> None:
             super().__init__("mapping_control_node")
-            qos = QoSProfile(
+            self.callback_group = ReentrantCallbackGroup()
+            self.goal_active = False
+            self.active_goal_handle = None
+            self.completed_build_result: dict[str, Any] | None = None
+            self.build_done = threading.Event()
+            self.build_lock = threading.RLock()
+            cloud_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.BEST_EFFORT,
                 history=QoSHistoryPolicy.KEEP_LAST,
                 depth=5,
                 durability=QoSDurabilityPolicy.VOLATILE,
             )
-            self.create_subscription(PointCloud2, args.cloud_topic, self.on_cloud, qos)
+            status_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self.status_pub = self.create_publisher(MappingStatus, "/mapping/status", status_qos)
+            self.create_subscription(PointCloud2, args.cloud_topic, self.on_cloud, cloud_qos)
+            self.build_server = ActionServer(self, BuildMap, "/mapping/build",
+                execute_callback=self.execute_build,
+                goal_callback=self.on_build_goal,
+                cancel_callback=self.on_build_cancel,
+                callback_group=self.callback_group,
+            )
+            self.create_service(SetBool, "/mapping/pause", self.on_pause, callback_group=self.callback_group)
+            self.create_service(SaveMap, "/mapping/save", self.on_save, callback_group=self.callback_group)
+            self.create_timer(args.status_period, self.publish_status, callback_group=self.callback_group)
             self.get_logger().info(
-                f"mapping control HTTP: http://{args.host}:{args.port}, "
+                "mapping control ready: "
+                f"build_action=/mapping/build, pause_service=/mapping/pause, "
+                f"save_service=/mapping/save, status_topic=/mapping/status, "
                 f"cloud_topic={args.cloud_topic}"
             )
+            self.publish_status()
 
         def on_cloud(self, msg: PointCloud2) -> None:
             # 将 ROS PointCloud2 转成 Nx3 numpy 数组，再交给纯 Python 状态逻辑处理。
             pts = point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"))
             session.ingest_xyz(pts)
 
+        def on_build_goal(self, goal_request: BuildMap.Goal) -> GoalResponse:
+            # 同一时间只允许一个建图会话，避免多个 App 客户端互相覆盖地图名和累计数据。
+            try:
+                sanitize_map_name(goal_request.map_name)
+            except ValueError as exc:
+                self.get_logger().error(f"reject mapping goal: {exc}")
+                return GoalResponse.REJECT
+            with self.build_lock:
+                if self.goal_active:
+                    self.get_logger().warn("reject mapping goal: another build goal is active")
+                    return GoalResponse.REJECT
+                self.goal_active = True
+                return GoalResponse.ACCEPT
+
+        def on_build_cancel(self, goal_handle) -> CancelResponse:
+            # 取消 action 表示丢弃未保存数据；execute_build 会完成真正的清理和返回。
+            return CancelResponse.ACCEPT
+
+        def execute_build(self, goal_handle) -> BuildMap.Result:
+            # build action 是一次建图会话：start 后持续 feedback，直到 save 成功或 action cancel。
+            started_at = time.monotonic()
+            with self.build_lock:
+                self.active_goal_handle = goal_handle
+                self.completed_build_result = None
+                self.build_done.clear()
+
+            try:
+                session.start(goal_handle.request.map_name)
+            except Exception as exc:
+                session.last_error = str(exc)
+                self.get_logger().error(f"mapping build failed to start: {exc}")
+                goal_handle.abort()
+                self.publish_status()
+                self._clear_active_goal()
+                return self._build_action_result(False, str(exc), "", "")
+
+            self.publish_status()
+            while rclpy.ok():
+                if goal_handle.is_cancel_requested:
+                    session.cancel()
+                    goal_handle.canceled()
+                    self.publish_status()
+                    result = self._build_action_result(False, "mapping cancelled", "", "")
+                    self._clear_active_goal()
+                    return result
+
+                with self.build_lock:
+                    completed = self.completed_build_result
+                if completed is not None:
+                    goal_handle.succeed()
+                    self.publish_status()
+                    result = self._build_action_result(
+                        bool(completed.get("success", False)),
+                        "map saved",
+                        str(completed.get("map_pgm_path", "")),
+                        str(completed.get("map_yaml_path", "")),
+                    )
+                    self._clear_active_goal()
+                    return result
+
+                goal_handle.publish_feedback(self._build_feedback(started_at))
+                self.publish_status()
+                self.build_done.wait(args.status_period)
+
+            goal_handle.abort()
+            self._clear_active_goal()
+            return self._build_action_result(False, "rclpy shutdown", "", "")
+
+        def on_pause(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+            # true 暂停累计，false 继续累计；Point-LIO 本体仍照常运行。
+            try:
+                session.pause(request.data)
+                response.success = True
+                response.message = "paused" if request.data else "mapping"
+            except Exception as exc:
+                session.last_error = str(exc)
+                response.success = False
+                response.message = str(exc)
+                self.get_logger().error(f"mapping pause failed: {exc}")
+            self.publish_status()
+            return response
+
+        def on_save(self, request: SaveMap.Request, response: SaveMap.Response) -> SaveMap.Response:
+            # 保存成功后唤醒 build action，让 action result 返回最终文件路径。
+            try:
+                map_name = request.map_name.strip() or None
+                result = session.save(map_name)
+                response.success = True
+                response.message = "map saved"
+                response.map_pgm_path = str(result["map_pgm_path"])
+                response.map_yaml_path = str(result["map_yaml_path"])
+                with self.build_lock:
+                    self.completed_build_result = result
+                    self.build_done.set()
+            except Exception as exc:
+                session.last_error = str(exc)
+                response.success = False
+                response.message = str(exc)
+                response.map_pgm_path = ""
+                response.map_yaml_path = ""
+                self.get_logger().error(f"mapping save failed: {exc}")
+            self.publish_status()
+            return response
+
+        def publish_status(self) -> None:
+            data = session.status()
+            status_msg = MappingStatus()
+            status_msg.header.stamp = self.get_clock().now().to_msg()
+            status_msg.header.frame_id = "map"
+            status_msg.state = str(data["state"])
+            status_msg.current_map_name = str(data["current_map_name"])
+            status_msg.coverage_percent = float(data["coverage_percent"])
+            status_msg.resolution = float(data["resolution"])
+            status_msg.width = int(data["width"])
+            status_msg.height = int(data["height"])
+            status_msg.last_error = str(data["last_error"])
+            self.status_pub.publish(status_msg)
+
+        def _build_feedback(self, started_at: float) -> BuildMap.Feedback:
+            data = session.status()
+            feedback = BuildMap.Feedback()
+            feedback.state = str(data["state"])
+            feedback.cells_known = int(data["cells_known"])
+            feedback.coverage_percent = float(data["coverage_percent"])
+            feedback.elapsed_sec = float(time.monotonic() - started_at)
+            feedback.resolution = float(data["resolution"])
+            feedback.width = int(data["width"])
+            feedback.height = int(data["height"])
+            return feedback
+
+        def _build_action_result(
+            self,
+            success: bool,
+            message: str,
+            pgm_path: str,
+            yaml_path: str,
+        ) -> BuildMap.Result:
+            result = BuildMap.Result()
+            result.success = success
+            result.message = message
+            result.map_pgm_path = pgm_path
+            result.map_yaml_path = yaml_path
+            return result
+
+        def _clear_active_goal(self) -> None:
+            with self.build_lock:
+                self.goal_active = False
+                self.active_goal_handle = None
+                self.completed_build_result = None
+                self.build_done.clear()
+
     rclpy.init()
     node = MappingControlNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -338,7 +536,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--free-z-min", default=-1.30, type=float)
     parser.add_argument("--free-z-max", default=-0.35, type=float)
     parser.add_argument("--occupied-dilation", default=1, type=int)
+    parser.add_argument("--status-period", default=1.0, type=float)
     parser.add_argument("--no-ros", action="store_true", help="start only HTTP server")
+    parser.add_argument("--enable-http", action="store_true", help="also start deprecated HTTP server")
     # ROS2 launch 会自动追加 --ros-args/-r 等参数；这里忽略未知参数，留给 rclpy 处理。
     args, _ = parser.parse_known_args(argv)
     return args
@@ -362,15 +562,18 @@ def main() -> None:
             occupied_dilation=args.occupied_dilation,
         )
     )
-    server = run_http_server(session, args.host, args.port)
     if args.no_ros:
+        server = run_http_server(session, args.host, args.port)
         try:
             print(f"mapping control HTTP: http://{args.host}:{args.port}")
             threading.Event().wait()
         except KeyboardInterrupt:
             server.shutdown()
         return
+    server = run_http_server(session, args.host, args.port) if args.enable_http else None
     run_ros(args, session)
+    if server is not None:
+        server.shutdown()
 
 
 if __name__ == "__main__":

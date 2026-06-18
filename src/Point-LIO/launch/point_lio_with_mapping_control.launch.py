@@ -14,14 +14,13 @@ def generate_launch_description():
     point_lio_cfg_dir = LaunchConfiguration("point_lio_cfg_dir")
     mapping_control = LaunchConfiguration("mapping_control")
     mapping_cloud_topic = LaunchConfiguration("mapping_cloud_topic")
-    mapping_http_host = LaunchConfiguration("mapping_http_host")
-    mapping_http_port = LaunchConfiguration("mapping_http_port")
     mapping_output_dir = LaunchConfiguration("mapping_output_dir")
     mapping_resolution = LaunchConfiguration("mapping_resolution")
     mapping_size_x = LaunchConfiguration("mapping_size_x")
     mapping_size_y = LaunchConfiguration("mapping_size_y")
     mapping_origin_x = LaunchConfiguration("mapping_origin_x")
     mapping_origin_y = LaunchConfiguration("mapping_origin_y")
+    mapping_status_period = LaunchConfiguration("mapping_status_period")
 
     point_lio_dir = get_package_share_directory("point_lio")
 
@@ -41,22 +40,12 @@ def generate_launch_description():
     declare_mapping_control = DeclareLaunchArgument(
         "mapping_control",
         default_value="True",
-        description="Whether to start the HTTP mapping control node",
+        description="Whether to start the mapping control node",
     )
     declare_mapping_cloud_topic = DeclareLaunchArgument(
         "mapping_cloud_topic",
         default_value="/cloud_registered",
         description="Point cloud topic accumulated by the mapping control node",
-    )
-    declare_mapping_http_host = DeclareLaunchArgument(
-        "mapping_http_host",
-        default_value="0.0.0.0",
-        description="HTTP bind host for App mapping control",
-    )
-    declare_mapping_http_port = DeclareLaunchArgument(
-        "mapping_http_port",
-        default_value="8088",
-        description="HTTP bind port for App mapping control",
     )
     declare_mapping_output_dir = DeclareLaunchArgument(
         "mapping_output_dir",
@@ -88,6 +77,11 @@ def generate_launch_description():
         default_value="-30.0",
         description="Saved occupancy map origin y in meters",
     )
+    declare_mapping_status_period = DeclareLaunchArgument(
+        "mapping_status_period",
+        default_value="1.0",
+        description="Seconds between /mapping/status publications",
+    )
 
     start_point_lio_node = Node(
         package="point_lio",
@@ -108,10 +102,6 @@ def generate_launch_description():
         arguments=[
             "--cloud-topic",
             mapping_cloud_topic,
-            "--host",
-            mapping_http_host,
-            "--port",
-            mapping_http_port,
             "--output-dir",
             mapping_output_dir,
             "--resolution",
@@ -124,6 +114,8 @@ def generate_launch_description():
             mapping_origin_x,
             "--origin-y",
             mapping_origin_y,
+            "--status-period",
+            mapping_status_period,
         ],
     )
 
@@ -148,14 +140,13 @@ def generate_launch_description():
             declare_point_lio_cfg_dir,
             declare_mapping_control,
             declare_mapping_cloud_topic,
-            declare_mapping_http_host,
-            declare_mapping_http_port,
             declare_mapping_output_dir,
             declare_mapping_resolution,
             declare_mapping_size_x,
             declare_mapping_size_y,
             declare_mapping_origin_x,
             declare_mapping_origin_y,
+            declare_mapping_status_period,
             start_point_lio_node,
             start_mapping_control_node,
             start_rviz_node,

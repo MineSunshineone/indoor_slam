@@ -11,6 +11,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(bxi_nav_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
@@ -30,9 +31,17 @@ add_executable(indoor_nav_goal src/main.cpp)
 add_executable(terrain_analysis src/terrain_analysis.cpp)
 
 ament_target_dependencies(indoor_nav_goal
+  bxi_nav_interfaces
+  geometry_msgs
   nav_msgs
+  nav2_msgs
   rclcpp
+  rclcpp_action
   sensor_msgs
+  std_msgs
+  std_srvs
+  tf2
+  tf2_geometry_msgs
 )
 
 ament_target_dependencies(terrain_analysis

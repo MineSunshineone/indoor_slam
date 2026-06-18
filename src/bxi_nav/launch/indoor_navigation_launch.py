@@ -114,6 +114,16 @@ def generate_launch_description():
         ),
         Node(
             package='nav',
+            executable='indoor_nav_goal',
+            name='app_nav_gateway',
+            output='screen',
+            parameters=[{
+                'frame_id': 'map',
+                'odom_topic': '/aft_mapped_to_init',
+            }]
+        ),
+        Node(
+            package='nav',
             executable='terrain_analysis',
             name='terrain_analysis',
             output='screen',
