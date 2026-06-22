@@ -1,9 +1,9 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from ament_index_python.packages import get_package_share_directory
 import os
 
@@ -104,13 +104,18 @@ def generate_launch_description():
                 'node_names': ['map_server'],
             }]
         ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(nav2_launch),
-            launch_arguments={
-                'params_file': params_file,
-                'use_sim_time': use_sim_time,
-                'autostart': autostart,
-            }.items()
+        GroupAction(
+            actions=[
+                SetRemap(src="/plan", dst="/debug/plan"),
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(nav2_launch),
+                    launch_arguments={
+                        'params_file': params_file,
+                        'use_sim_time': use_sim_time,
+                        'autostart': autostart,
+                    }.items()
+                ),
+            ]
         ),
         Node(
             package='nav',
@@ -120,6 +125,7 @@ def generate_launch_description():
             parameters=[{
                 'frame_id': 'map',
                 'odom_topic': '/aft_mapped_to_init',
+                'robot_base_frame': 'base_link',
             }]
         ),
         Node(

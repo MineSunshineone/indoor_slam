@@ -10,12 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -53,13 +54,24 @@ class MappingConfig:
     free_z_max: float = -0.35
     # 障碍物膨胀格数，用于给 Nav2 留出安全边界。
     occupied_dilation: int = 1
+    # 使用外部 PCD 转图程序生成导航地图和重定位点云。
+    pcd2pgm_enabled: bool = True
+    pcd2pgm_executable: Path = Path("pcd2pgm_headless")
+    pcd2pgm_config: Path = Path("scans_nav2_map.cfg")
+    pcd_input_path: Path = Path("src/Point-LIO/PCD/scans.pcd")
+    relocalization_pcd_path: Path = Path("maps/PCD/scans.pcd")
 
 
 class MappingSession:
     """单次 App 建图任务的线程安全内存状态。"""
 
-    def __init__(self, config: MappingConfig) -> None:
+    def __init__(
+        self,
+        config: MappingConfig,
+        command_runner: Callable[[list[str], Path], None] | None = None,
+    ) -> None:
         self.config = config
+        self.command_runner = command_runner or self._run_command
         # 根据物理尺寸和分辨率换算固定大小的二维栅格。
         self.width = int(round(config.size_x / config.resolution))
         self.height = int(round(config.size_y / config.resolution))
@@ -69,6 +81,9 @@ class MappingSession:
         self.state = "idle"
         self.current_map_name = ""
         self.last_error = ""
+        self.last_map_pgm_path = ""
+        self.last_map_yaml_path = ""
+        self.last_relocalization_pcd_path = ""
         # 分别累计障碍物证据和空闲证据；保存时再融合成 Nav2 占据栅格。
         self.occ_counts = np.zeros((self.height, self.width), dtype=np.uint32)
         self.free_counts = np.zeros((self.height, self.width), dtype=np.uint32)
@@ -133,12 +148,20 @@ class MappingSession:
 
             self.state = "saving"
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
-            pgm_path = self._pgm_path()
-            yaml_path = self._yaml_path()
-            grid = self._build_grid()
-            self._write_pgm(pgm_path, grid)
-            self._write_yaml(yaml_path, pgm_path.name)
+            try:
+                if self.config.pcd2pgm_enabled:
+                    paths = self._run_pcd2pgm_conversion()
+                else:
+                    paths = self._write_accumulated_grid()
+            except Exception as exc:
+                self.state = "error"
+                self.last_error = str(exc)
+                raise
+            self.last_map_pgm_path = str(paths["map_pgm_path"])
+            self.last_map_yaml_path = str(paths["map_yaml_path"])
+            self.last_relocalization_pcd_path = str(paths["relocalization_pcd_path"])
             self.state = "saved"
+            self.last_error = ""
             result = self.status()
             result["success"] = True
             return result
@@ -150,8 +173,13 @@ class MappingSession:
             return {
                 "state": self.state,
                 "current_map_name": self.current_map_name,
-                "map_pgm_path": str(self._pgm_path()) if self.current_map_name else "",
-                "map_yaml_path": str(self._yaml_path()) if self.current_map_name else "",
+                "map_pgm_path": self.last_map_pgm_path or (
+                    str(self._pgm_path()) if self.current_map_name else ""
+                ),
+                "map_yaml_path": self.last_map_yaml_path or (
+                    str(self._yaml_path()) if self.current_map_name else ""
+                ),
+                "relocalization_pcd_path": self.last_relocalization_pcd_path,
                 "cells_known": cells_known,
                 "coverage_percent": coverage_percent,
                 "resolution": self.config.resolution,
@@ -170,6 +198,84 @@ class MappingSession:
 
     def _yaml_path(self) -> Path:
         return self.config.output_dir / f"{self.current_map_name}.yaml"
+
+    def _write_accumulated_grid(self) -> dict[str, Path]:
+        pgm_path = self._pgm_path()
+        yaml_path = self._yaml_path()
+        grid = self._build_grid()
+        self._write_pgm(pgm_path, grid)
+        self._write_yaml(yaml_path, pgm_path.name)
+        return {
+            "map_pgm_path": pgm_path,
+            "map_yaml_path": yaml_path,
+            "relocalization_pcd_path": Path(""),
+        }
+
+    def _run_pcd2pgm_conversion(self) -> dict[str, Path]:
+        cfg = self.config
+        executable = self._resolve_path(cfg.pcd2pgm_executable)
+        config_path = self._resolve_path(cfg.pcd2pgm_config)
+        pcd_input = self._resolve_path(cfg.pcd_input_path)
+        relocalization_pcd = self._resolve_path(cfg.relocalization_pcd_path)
+        output_dir = self._resolve_path(cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        relocalization_pcd.parent.mkdir(parents=True, exist_ok=True)
+
+        if not pcd_input.exists():
+            raise FileNotFoundError(f"Point-LIO PCD not found: {pcd_input}")
+        if not config_path.exists():
+            raise FileNotFoundError(f"pcd2pgm config not found: {config_path}")
+        if not executable.exists():
+            raise FileNotFoundError(f"pcd2pgm executable not found: {executable}")
+
+        cmd = [
+            str(executable),
+            "--headless",
+            str(pcd_input),
+            "--config",
+            str(config_path),
+            "--save-point-cloud",
+            str(relocalization_pcd),
+        ]
+        self.command_runner(cmd, output_dir)
+
+        output_stem = self._pcd2pgm_output_stem(config_path)
+        pgm_path = output_dir / f"{output_stem}.pgm"
+        yaml_path = output_dir / f"{output_stem}.yaml"
+        missing = [
+            str(path)
+            for path in (pgm_path, yaml_path, relocalization_pcd)
+            if not path.exists()
+        ]
+        if missing:
+            raise RuntimeError("pcd2pgm did not create expected output: " + ", ".join(missing))
+        return {
+            "map_pgm_path": pgm_path,
+            "map_yaml_path": yaml_path,
+            "relocalization_pcd_path": relocalization_pcd,
+        }
+
+    def _pcd2pgm_output_stem(self, config_path: Path) -> str:
+        for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "output_stem":
+                stem = value.strip()
+                if stem:
+                    return sanitize_map_name(stem)
+        return self.current_map_name
+
+    def _resolve_path(self, path: Path) -> Path:
+        return path if path.is_absolute() else (Path.cwd() / path)
+
+    def _run_command(self, cmd: list[str], cwd: Path) -> None:
+        try:
+            subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            details = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"pcd2pgm conversion failed: {details}") from exc
 
     def _build_grid(self) -> np.ndarray:
         # Nav2/ROS PGM 约定：0 表示占用，254 表示空闲，205 通常作为未知灰度。
@@ -307,7 +413,7 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
     from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
-    from std_srvs.srv import SetBool
+    from std_srvs.srv import SetBool, Trigger
 
     class MappingControlNode(Node):
         """订阅 Point-LIO 点云，并提供 App 建图 action/service/topic。"""
@@ -342,6 +448,14 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             )
             self.create_service(SetBool, "/mapping/pause", self.on_pause, callback_group=self.callback_group)
             self.create_service(SaveMap, "/mapping/save", self.on_save, callback_group=self.callback_group)
+            self.point_lio_start_client = self.create_client(Trigger, "/point_lio/mapping/start",
+                callback_group=self.callback_group)
+            self.point_lio_pause_client = self.create_client(SetBool, "/point_lio/mapping/pause",
+                callback_group=self.callback_group)
+            self.point_lio_save_client = self.create_client(Trigger, "/point_lio/mapping/save",
+                callback_group=self.callback_group)
+            self.point_lio_cancel_client = self.create_client(Trigger, "/point_lio/mapping/cancel",
+                callback_group=self.callback_group)
             self.create_timer(args.status_period, self.publish_status, callback_group=self.callback_group)
             self.get_logger().info(
                 "mapping control ready: "
@@ -383,6 +497,8 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
                 self.build_done.clear()
 
             try:
+                self._call_point_lio_trigger(self.point_lio_start_client,
+                    "start Point-LIO mapping accumulation")
                 session.start(goal_handle.request.map_name)
             except Exception as exc:
                 session.last_error = str(exc)
@@ -395,6 +511,12 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             self.publish_status()
             while rclpy.ok():
                 if goal_handle.is_cancel_requested:
+                    try:
+                        self._call_point_lio_trigger(self.point_lio_cancel_client,
+                            "cancel Point-LIO mapping accumulation")
+                    except Exception as exc:
+                        session.last_error = str(exc)
+                        self.get_logger().error(f"Point-LIO mapping cancel failed: {exc}")
                     session.cancel()
                     goal_handle.canceled()
                     self.publish_status()
@@ -427,6 +549,13 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
         def on_pause(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
             # true 暂停累计，false 继续累计；Point-LIO 本体仍照常运行。
             try:
+                current = session.status()
+                if not current["current_map_name"] or current["state"] in {"idle", "cancelled"}:
+                    raise RuntimeError("no active mapping task")
+                self._call_point_lio_set_bool(self.point_lio_pause_client, request.data,
+                    "pause Point-LIO mapping accumulation" if request.data
+                    else "resume Point-LIO mapping accumulation",
+                )
                 session.pause(request.data)
                 response.success = True
                 response.message = "paused" if request.data else "mapping"
@@ -442,6 +571,9 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             # 保存成功后唤醒 build action，让 action result 返回最终文件路径。
             try:
                 map_name = request.map_name.strip() or None
+                if map_name is not None:
+                    sanitize_map_name(map_name)
+                self._call_point_lio_trigger(self.point_lio_save_client, "save Point-LIO PCD map")
                 result = session.save(map_name)
                 response.success = True
                 response.message = "map saved"
@@ -473,6 +605,36 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             status_msg.height = int(data["height"])
             status_msg.last_error = str(data["last_error"])
             self.status_pub.publish(status_msg)
+
+        def _call_point_lio_trigger(self, client, action_name: str) -> str:
+            return self._call_point_lio_service(client, Trigger.Request(), action_name)
+
+        def _call_point_lio_set_bool(self, client, value: bool, action_name: str) -> str:
+            request = SetBool.Request()
+            request.data = value
+            return self._call_point_lio_service(client, request, action_name)
+
+        def _call_point_lio_service(self, client, request, action_name: str) -> str:
+            deadline = time.monotonic() + 10.0
+            while rclpy.ok() and not client.wait_for_service(timeout_sec=0.1):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"timeout waiting to {action_name}")
+
+            future = client.call_async(request)
+            while rclpy.ok() and not future.done():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"timeout trying to {action_name}")
+                time.sleep(0.02)
+
+            if not future.done():
+                raise RuntimeError(f"ROS shutdown while trying to {action_name}")
+            result = future.result()
+            if result is None:
+                raise RuntimeError(f"failed to {action_name}: empty response")
+            if not result.success:
+                message = result.message or "service returned success=false"
+                raise RuntimeError(f"failed to {action_name}: {message}")
+            return result.message
 
         def _build_feedback(self, started_at: float) -> BuildMap.Feedback:
             data = session.status()
@@ -537,6 +699,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--free-z-max", default=-0.35, type=float)
     parser.add_argument("--occupied-dilation", default=1, type=int)
     parser.add_argument("--status-period", default=1.0, type=float)
+    parser.add_argument("--pcd2pgm-executable", default="pcd2pgm_headless", type=Path)
+    parser.add_argument("--pcd2pgm-config", default="scans_nav2_map.cfg", type=Path)
+    parser.add_argument("--pcd-input-path", default="src/Point-LIO/PCD/scans.pcd", type=Path)
+    parser.add_argument(
+        "--relocalization-pcd-path",
+        default="maps/PCD/scans.pcd",
+        type=Path,
+    )
+    parser.add_argument("--disable-pcd2pgm", action="store_true")
     parser.add_argument("--no-ros", action="store_true", help="start only HTTP server")
     parser.add_argument("--enable-http", action="store_true", help="also start deprecated HTTP server")
     # ROS2 launch 会自动追加 --ros-args/-r 等参数；这里忽略未知参数，留给 rclpy 处理。
@@ -560,6 +731,11 @@ def main() -> None:
             free_z_min=args.free_z_min,
             free_z_max=args.free_z_max,
             occupied_dilation=args.occupied_dilation,
+            pcd2pgm_enabled=not args.disable_pcd2pgm,
+            pcd2pgm_executable=args.pcd2pgm_executable,
+            pcd2pgm_config=args.pcd2pgm_config,
+            pcd_input_path=args.pcd_input_path,
+            relocalization_pcd_path=args.relocalization_pcd_path,
         )
     )
     if args.no_ros:

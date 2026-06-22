@@ -26,7 +26,10 @@
 #include "std_srvs/srv/set_bool.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
+#include "tf2/exceptions.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
 
 using namespace std::chrono_literals;
 
@@ -103,9 +106,13 @@ public:
   AppNavGateway()
   : Node("app_nav_gateway")
   {
-    // frame_id 是 App 目标点所在坐标系；odom_topic 是 Point-LIO 输出的当前位置来源。
+    // frame_id 是 App 目标点所在坐标系；odom_topic 触发 /nav/pose 更新并提供速度。
     frame_id_ = this->declare_parameter<std::string>("frame_id", "map");
     odom_topic_ = this->declare_parameter<std::string>("odom_topic", "/aft_mapped_to_init");
+    robot_base_frame_ = this->declare_parameter<std::string>("robot_base_frame", "base_link");
+
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     // /nav/pose 和 /nav/status 使用 transient_local，让 App 新订阅后能立刻拿到最近一帧。
     auto latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -583,14 +590,27 @@ private:
     response->message = "terrain clearing requested";
   }
 
-  // Point-LIO 原始 odometry -> App 友好的 NavPose：保留 x/y/twist，并把四元数转 yaw。
+  // App 位姿使用 map 下的 base_link；Point-LIO odometry 只用于触发更新并保留速度。
   void onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    geometry_msgs::msg::TransformStamped robot_pose_transform;
+    try {
+      robot_pose_transform =
+        tf_buffer_->lookupTransform(frame_id_, robot_base_frame_, tf2::TimePointZero);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Skip /nav/pose because TF %s -> %s is unavailable: %s",
+        frame_id_.c_str(), robot_base_frame_.c_str(), ex.what());
+      return;
+    }
+
     NavPose pose;
-    pose.header = msg->header;
-    pose.x = msg->pose.pose.position.x;
-    pose.y = msg->pose.pose.position.y;
-    pose.yaw = quaternionToYaw(msg->pose.pose.orientation);
+    pose.header.stamp = robot_pose_transform.header.stamp;
+    pose.header.frame_id = frame_id_;
+    pose.x = robot_pose_transform.transform.translation.x;
+    pose.y = robot_pose_transform.transform.translation.y;
+    pose.yaw = quaternionToYaw(robot_pose_transform.transform.rotation);
     pose.twist = msg->twist.twist;
     pose_pub_->publish(pose);
   }
@@ -674,9 +694,12 @@ private:
     status_pub_->publish(status);
   }
 
-  // frame_id_ 决定 App 目标点和 /nav/status 所属坐标系；odom_topic_ 是位姿输入源。
+  // frame_id_ 决定 App 目标点、/nav/status 和 /nav/pose 所属坐标系。
   std::string frame_id_;
+  std::string robot_base_frame_;
   std::string odom_topic_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // 网关内部状态由 action 执行线程、service 回调和 timer 共同访问，因此统一用锁保护。
   std::mutex state_mutex_;

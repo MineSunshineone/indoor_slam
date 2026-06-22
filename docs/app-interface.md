@@ -1,6 +1,6 @@
 # Indoor SLAM App 对接接口文档
 
-本文档只列出当前系统已有的 ROS 2 接口，供 App 侧或中间层对接时查阅。
+本文档列出 App 侧对接所需的全部 ROS 2 接口。导航和建图分别收敛在 `/nav` 和 `/mapping` 两个命名空间下，不再使用 HTTP。
 
 ## 1. 基础信息
 
@@ -12,6 +12,7 @@
 | 里程计坐标系 | `odom` |
 | 机器人坐标系 | `base_link` |
 | 默认地图 | `src/bxi_nav/maps/maps.yaml` |
+| 自定义接口包 | `bxi_nav_interfaces` |
 
 启动完整系统：
 
@@ -26,406 +27,164 @@ source install/setup.bash
 ros2 launch nav indoor_navigation_launch.py
 ```
 
-## 2. 地图数据
+## 2. App 接入方式
+
+App 不需要安装 ROS 或 DDS。系统在机器人上运行 `rosbridge_server`，App 通过 websocket + JSON 访问所有接口。
 
 | 项目 | 值 |
 | --- | --- |
-| Topic | `/map` |
-| 类型 | `nav_msgs/msg/OccupancyGrid` |
-| 发布源 | `nav2_map_server` |
-| 坐标系 | `map` |
-| 用途 | 静态 2D 栅格地图 |
+| 地址 | `ws://<机器人IP>:9090` |
+| 协议 | rosbridge v2（JSON） |
+| 可访问 | topic / service / action |
 
-查看地图信息：
+JSON 操作对应关系：
+
+| 接口种类 | 调用方式 | rosbridge op |
+| --- | --- | --- |
+| service | 调用并等回执 | `call_service` |
+| topic | 订阅推送 | `subscribe` |
+| action | 发目标、收反馈 | `send_action_goal` |
+| action | 取消目标 | `cancel_action_goal` |
+
+## 3. 命名空间约定
+
+| 命名空间 | 用途 |
+| --- | --- |
+| `/nav` | 导航相关 |
+| `/mapping` | 建图相关 |
+| 顶层 | 地图数据和标准 topic（`/map`、`/scan` 等） |
+
+Nav2 内部仍使用标准接口名（`/navigate_to_pose`、`/initialpose` 等）。`/nav` 下的接口由网关节点转译，App 只对接 `/nav` 即可，不直接接触 Nav2 原始接口。
+
+## 4. 导航接口
+
+### 4.1 接口列表
+
+| 操作 | 名称 | 类型 | 种类 |
+| --- | --- | --- | --- |
+| 设初始位姿 | `/nav/init` | `bxi_nav_interfaces/srv/SetInitialPose` | service |
+| 发导航目标 | `/nav/goto` | `bxi_nav_interfaces/action/NavGoto` | action |
+| 暂停 / 继续 | `/nav/pause` | `std_srvs/srv/SetBool` | service |
+| 取消 | 取消 `/nav/goto` 目标 | — | action cancel |
+| 多点巡航 | `/nav/follow_waypoints` | `bxi_nav_interfaces/action/FollowWaypoints` | action |
+| 当前位姿 | `/nav/pose` | `bxi_nav_interfaces/msg/NavPose` | topic |
+| 导航状态 | `/nav/status` | `bxi_nav_interfaces/msg/NavStatus` | topic |
+
+### 4.2 设初始位姿
+
+App 给 x/y/yaw，网关内部转四元数后发布到 `/initialpose`。
 
 ```bash
-ros2 topic echo --once /map --field info
+ros2 service call /nav/init bxi_nav_interfaces/srv/SetInitialPose \
+  "{x: 0.0, y: 0.0, yaw: 0.0}"
 ```
 
-`OccupancyGrid` 关键字段：
+### 4.3 发导航目标
+
+目标方向用 yaw（弧度），网关内部转四元数。发出后通过 action feedback 持续收到剩余距离、剩余时间。
+
+```bash
+ros2 action send_goal /nav/goto bxi_nav_interfaces/action/NavGoto \
+  "{x: 1.2, y: 0.5, yaw: 1.57}" --feedback
+```
+
+NavGoto 状态流转：
+
+```
+send goal -> navigating -> succeeded / canceled / failed
+                 |
+            pause(true) -> paused -> pause(false) -> navigating
+```
+
+### 4.4 暂停与继续
+
+```bash
+ros2 service call /nav/pause std_srvs/srv/SetBool "{data: true}"   # 暂停
+ros2 service call /nav/pause std_srvs/srv/SetBool "{data: false}"  # 继续
+```
+
+### 4.5 取消导航
+
+取消当前 `/nav/goto` 目标。rosbridge 用 `cancel_action_goal`，命令行用：
+
+```bash
+ros2 action send_goal ... 后 Ctrl+C，或在客户端发 cancel
+```
+
+### 4.6 当前位姿
 
 | 字段 | 说明 |
 | --- | --- |
-| `header.frame_id` | 地图坐标系，通常为 `map` |
-| `info.resolution` | 分辨率，单位 m/cell |
-| `info.width` | 地图宽度，单位 cell |
-| `info.height` | 地图高度，单位 cell |
-| `info.origin` | 地图左下角在 `map` 坐标系下的位姿 |
-| `data` | 一维栅格数组，长度为 `width * height` |
-
-栅格值：
-
-| 值 | 含义 |
-| --- | --- |
-| `-1` | 未知 |
-| `0` | 空闲 |
-| `100` | 占用 / 障碍 |
-
-坐标换算：
-
-```text
-index = y_cell * width + x_cell
-map_x = origin.position.x + x_cell * resolution
-map_y = origin.position.y + y_cell * resolution
-```
-
-## 3. 发送导航目标
-
-| 项目 | 值 |
-| --- | --- |
-| Action | `/navigate_to_pose` |
-| 类型 | `nav2_msgs/action/NavigateToPose` |
-| 坐标系 | `map` |
-| 用途 | 发送单点导航目标 |
-
-命令行示例：
+| `x` / `y` | 平面坐标，单位 m |
+| `yaw` | 朝向，单位 rad |
+| `twist` | 速度信息 |
 
 ```bash
-ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
-"{
-  pose: {
-    header: {frame_id: 'map'},
-    pose: {
-      position: {x: 1.2, y: 0.5, z: 0.0},
-      orientation: {z: 0.0, w: 1.0}
-    }
-  },
-  behavior_tree: ''
-}" --feedback
+ros2 topic echo --once /nav/pose
 ```
 
-目标方向使用四元数。只设置 yaw 时：
-
-```text
-orientation.x = 0
-orientation.y = 0
-orientation.z = sin(yaw / 2)
-orientation.w = cos(yaw / 2)
-```
-
-## 4. 取消导航
-
-| 项目 | 值 |
-| --- | --- |
-| Action | `/navigate_to_pose` |
-| 操作 | cancel goal |
-| 用途 | 取消当前导航目标 |
-
-命令行示例：
-
-```bash
-ros2 action cancel /navigate_to_pose
-```
-
-## 5. 导航状态
-
-导航状态来自 `/navigate_to_pose` action 的 goal status、feedback 和 result。
-
-查看 action 信息：
-
-```bash
-ros2 action info /navigate_to_pose
-```
-
-发送目标并查看反馈：
-
-```bash
-ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
-"{
-  pose: {
-    header: {frame_id: 'map'},
-    pose: {
-      position: {x: 1.2, y: 0.5, z: 0.0},
-      orientation: {z: 0.0, w: 1.0}
-    }
-  }
-}" --feedback
-```
-
-常用反馈字段：
+### 4.7 导航状态
 
 | 字段 | 说明 |
 | --- | --- |
-| `current_pose` | 当前位姿 |
-| `navigation_time` | 已导航时间 |
-| `estimated_time_remaining` | 预计剩余时间 |
+| `state` | `idle` / `navigating` / `paused` / `succeeded` / `canceled` / `failed` |
 | `distance_remaining` | 剩余距离 |
+| `estimated_time_remaining` | 预计剩余时间 |
+| `navigation_time` | 已导航时间 |
 | `number_of_recoveries` | 恢复行为次数 |
 
-## 6. 机器人当前位置
+`/nav/status` 为 latched topic，订阅后立即收到最新状态，之后变化时推送。
 
-| 项目 | 值 |
-| --- | --- |
-| Topic | `/aft_mapped_to_init` |
-| 类型 | `nav_msgs/msg/Odometry` |
-| 发布源 | Point-LIO |
-| 用途 | 机器人当前位置和姿态 |
+## 5. 建图接口
 
-命令行示例：
+### 5.1 接口列表
+
+| 操作 | 名称 | 类型 | 种类 |
+| --- | --- | --- | --- |
+| 开始建图 | `/mapping/build` | `bxi_nav_interfaces/action/BuildMap` | action |
+| 暂停 / 继续累积 | `/mapping/pause` | `std_srvs/srv/SetBool` | service |
+| 保存并完成 | `/mapping/save` | `bxi_nav_interfaces/srv/SaveMap` | service |
+| 取消 | 取消 `/mapping/build` 目标 | — | action cancel |
+| 清除地形点云 | `/mapping/clear_terrain` | `bxi_nav_interfaces/srv/ClearTerrain` | service |
+| 建图状态 | `/mapping/status` | `bxi_nav_interfaces/msg/MappingStatus` | topic |
+
+地图名限制：只能包含英文字母、数字、下划线和短横线，长度 1-64，例如 `floor_1`。
+
+### 5.2 开始建图
+
+发 `/mapping/build` 目标即开始累积，goal 持续活跃表示会话进行中。建图进度通过 action feedback 推送。
 
 ```bash
-ros2 topic echo --once /aft_mapped_to_init
+ros2 action send_goal /mapping/build bxi_nav_interfaces/action/BuildMap \
+  "{map_name: 'floor_1'}" --feedback
 ```
 
-常用字段：
+feedback 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `pose.pose.position.x` | x 坐标，单位 m |
-| `pose.pose.position.y` | y 坐标，单位 m |
-| `pose.pose.position.z` | z 坐标，单位 m |
-| `pose.pose.orientation` | 姿态四元数 |
-| `twist.twist` | 速度信息 |
+| `state` | `mapping` / `paused` |
+| `cells_known` | 已知栅格数 |
+| `coverage_percent` | 覆盖率 |
+| `elapsed_sec` | 已建图时长 |
+| `resolution` / `width` / `height` | 当前地图参数 |
 
-## 7. 初始化定位
+### 5.3 暂停与继续累积
 
-| 项目 | 值 |
-| --- | --- |
-| Topic | `/initialpose` |
-| 类型 | `geometry_msgs/msg/PoseWithCovarianceStamped` |
-| 坐标系 | `map` |
-| 用途 | 给重定位节点设置初始位姿 |
-
-命令行示例：
+暂停时 Point-LIO 继续运行，仅停止地图累积。不结束会话。
 
 ```bash
-ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
-"{
-  header: {frame_id: 'map'},
-  pose: {
-    pose: {
-      position: {x: 0.0, y: 0.0, z: 0.0},
-      orientation: {z: 0.0, w: 1.0}
-    },
-    covariance: [0.25, 0, 0, 0, 0, 0,
-                 0, 0.25, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0.0685]
-  }
-}"
+ros2 service call /mapping/pause std_srvs/srv/SetBool "{data: true}"   # 暂停
+ros2 service call /mapping/pause std_srvs/srv/SetBool "{data: false}"  # 继续
 ```
 
-## 8. 清除局部地形点云
+### 5.4 保存并完成
 
-| 项目 | 值 |
-| --- | --- |
-| Topic | `/map_clearing` |
-| 类型 | `std_msgs/msg/Float32` |
-| 单位 | m |
-| 用途 | 发布清除半径，触发地形点云清理 |
-
-命令行示例：
+写出 Nav2 可加载的 `.pgm` 和 `.yaml`，同时让 `/mapping/build` 成功结束，result 返回文件路径。
 
 ```bash
-ros2 topic pub --once /map_clearing std_msgs/msg/Float32 "{data: 8.0}"
-```
-
-## 9. 点云、路径与调试数据
-
-| Topic | 类型 | 说明 |
-| --- | --- | --- |
-| `/cloud_registered` | `sensor_msgs/msg/PointCloud2` | Point-LIO 配准点云 |
-| `/terrain_map` | `sensor_msgs/msg/PointCloud2` | 地形 / 障碍点云 |
-| `/scan` | `sensor_msgs/msg/LaserScan` | 点云转 2D 激光，供 Nav2 局部代价地图使用 |
-| `/path` | `nav_msgs/msg/Path` | Point-LIO 轨迹 |
-| `/plan` | `nav_msgs/msg/Path` | Nav2 全局规划路径 |
-| `/local_plan` | `nav_msgs/msg/Path` | 本项目局部 A* 路径调试输出 |
-| `/free_paths` | `sensor_msgs/msg/PointCloud2` | 可通行候选路径点云 |
-
-## 10. 建图控制
-
-建图控制由 `point_lio` 包内的 `mapping_control_node.py` 提供。该节点订阅 Point-LIO 的 `/cloud_registered` 点云，并在 App 发送控制话题后累积生成 2D 栅格地图；暂停时 Point-LIO 仍继续运行，但不再累积地图；取消会清空当前未保存地图；保存会生成 Nav2 可直接加载的 `.pgm` 和 `.yaml`。
-
-推荐启动方式：使用集成 launch 同时启动 Point-LIO 和建图控制节点。
-
-```bash
-source install/setup.bash
-ros2 launch point_lio point_lio_with_mapping_control.launch.py
-```
-
-默认输出目录：
-
-```text
-src/bxi_nav/maps
-```
-
-可选参数：
-
-```bash
-ros2 launch point_lio point_lio_with_mapping_control.launch.py \
-  mapping_http_host:=0.0.0.0 \
-  mapping_http_port:=8088 \
-  mapping_cloud_topic:=/cloud_registered \
-  mapping_output_dir:=src/bxi_nav/maps \
-  mapping_resolution:=0.10 \
-  mapping_size_x:=60.0 \
-  mapping_size_y:=60.0 \
-  mapping_origin_x:=-30.0 \
-  mapping_origin_y:=-30.0 \
-  mapping_status_period:=1.0
-```
-
-地图名限制：`map_name` 只能包含英文字母、数字、下划线和短横线，长度 1-64，例如 `floor_1`。
-
-### 10.1 ROS Topic 对接（推荐）
-
-| Topic | 类型 | 方向 | QoS | 用途 |
-| --- | --- | --- | --- | --- |
-| `/mapping/start` | `std_msgs/msg/String` | App 发布 | Reliable / Volatile / KeepLast(10) | 开始建图；`data` 填地图名 |
-| `/mapping/pause` | `std_msgs/msg/Bool` | App 发布 | Reliable / Volatile / KeepLast(10) | `true` 暂停累积，`false` 继续累积 |
-| `/mapping/cancel` | `std_msgs/msg/Empty` | App 发布 | Reliable / Volatile / KeepLast(10) | 取消当前建图并清空未保存数据 |
-| `/mapping/save` | `std_msgs/msg/String` | App 发布 | Reliable / Volatile / KeepLast(10) | 保存地图；`data` 为空时使用当前地图名 |
-| `/mapping/status` | `std_msgs/msg/String` | App 订阅 | Reliable / Transient Local / KeepLast(1) | JSON 状态，包含当前地图名和保存路径 |
-
-点云输入 `/cloud_registered` 使用 SensorData 风格 QoS：Best Effort / Volatile / KeepLast(5)，用于匹配 Point-LIO 高频点云发布。
-
-开始建图：
-
-```bash
-ros2 topic pub --once /mapping/start std_msgs/msg/String "{data: 'floor_1'}"
-```
-
-暂停建图：
-
-```bash
-ros2 topic pub --once /mapping/pause std_msgs/msg/Bool "{data: true}"
-```
-
-继续建图：
-
-```bash
-ros2 topic pub --once /mapping/pause std_msgs/msg/Bool "{data: false}"
-```
-
-取消建图：
-
-```bash
-ros2 topic pub --once /mapping/cancel std_msgs/msg/Empty "{}"
-```
-
-保存地图：
-
-```bash
-ros2 topic pub --once /mapping/save std_msgs/msg/String "{data: 'floor_1'}"
-```
-
-如果保存时不想改名，可以发布空字符串，节点会使用 `/mapping/start` 时设置的当前地图名：
-
-```bash
-ros2 topic pub --once /mapping/save std_msgs/msg/String "{data: ''}"
-```
-
-查看状态：
-
-```bash
-ros2 topic echo /mapping/status
-```
-
-`/mapping/status` 的 `data` 是 JSON 字符串，示例：
-
-```json
-{
-  "state": "mapping",
-  "current_map_name": "floor_1",
-  "map_pgm_path": "src/bxi_nav/maps/floor_1.pgm",
-  "map_yaml_path": "src/bxi_nav/maps/floor_1.yaml",
-  "resolution": 0.1,
-  "width": 600,
-  "height": 600,
-  "last_error": ""
-}
-```
-
-状态含义：
-
-| 状态 | 含义 |
-| --- | --- |
-| `idle` | 控制节点已启动，但未开始建图 |
-| `mapping` | 正在累积地图 |
-| `paused` | 已暂停地图累积 |
-| `saving` | 正在保存地图 |
-| `saved` | 地图已保存 |
-| `cancelled` | 当前建图已取消，未保存数据已清空 |
-| `error` | 出现错误，查看 `last_error` |
-
-### 10.2 HTTP 兼容接口：开始建图
-
-| 项目 | 值 |
-| --- | --- |
-| HTTP | `POST /mapping/start` |
-| 用途 | 清空旧累积数据，设置当前地图名，并开始累积新地图 |
-
-请求示例：
-
-```bash
-curl -X POST http://<机器人IP>:8088/mapping/start \
-  -H "Content-Type: application/json" \
-  -d '{"map_name":"floor_1"}'
-```
-
-返回示例：
-
-```json
-{
-  "success": true,
-  "state": "mapping",
-  "current_map_name": "floor_1",
-  "map_pgm_path": "src/bxi_nav/maps/floor_1.pgm",
-  "map_yaml_path": "src/bxi_nav/maps/floor_1.yaml"
-}
-```
-
-### 10.3 HTTP 兼容接口：暂停或继续建图
-
-| 项目 | 值 |
-| --- | --- |
-| HTTP | `POST /mapping/pause` |
-| 用途 | 暂停或继续地图累积；不停止 Point-LIO 定位 |
-
-暂停：
-
-```bash
-curl -X POST http://<机器人IP>:8088/mapping/pause \
-  -H "Content-Type: application/json" \
-  -d '{"paused":true}'
-```
-
-继续：
-
-```bash
-curl -X POST http://<机器人IP>:8088/mapping/pause \
-  -H "Content-Type: application/json" \
-  -d '{"paused":false}'
-```
-
-### 10.4 HTTP 兼容接口：取消建图
-
-| 项目 | 值 |
-| --- | --- |
-| HTTP | `POST /mapping/cancel` |
-| 用途 | 清空当前未保存地图数据，不生成地图文件 |
-
-命令示例：
-
-```bash
-curl -X POST http://<机器人IP>:8088/mapping/cancel
-```
-
-### 10.5 HTTP 兼容接口：保存地图
-
-| 项目 | 值 |
-| --- | --- |
-| HTTP | `POST /mapping/save` |
-| 用途 | 将当前累积地图保存为 Nav2 `.pgm` 和 `.yaml` |
-
-命令示例：
-
-```bash
-curl -X POST http://<机器人IP>:8088/mapping/save \
-  -H "Content-Type: application/json" \
-  -d '{"map_name":"floor_1"}'
+ros2 service call /mapping/save bxi_nav_interfaces/srv/SaveMap \
+  "{map_name: 'floor_1'}"
 ```
 
 输出文件：
@@ -435,145 +194,246 @@ src/bxi_nav/maps/floor_1.pgm
 src/bxi_nav/maps/floor_1.yaml
 ```
 
-注意：这个接口保存的是 App/导航使用的 **2D 栅格地图**，不是 Point-LIO 原始 PCD 点云地图。Point-LIO 自带的 PCD 保存由 `pcd_save.pcd_save_en` 控制，通常在 Point-LIO 正常退出时写入：
+### 5.5 取消建图
+
+取消 `/mapping/build` 目标。清空未保存数据，不生成文件。已通过 save 写出的文件不受影响。
+
+### 5.6 清除地形点云
+
+```bash
+ros2 service call /mapping/clear_terrain bxi_nav_interfaces/srv/ClearTerrain \
+  "{radius: 8.0}"
+```
+
+### 5.7 建图状态
+
+供未持有 build 目标的客户端查看。
+
+| 字段 | 说明 |
+| --- | --- |
+| `state` | `idle` / `mapping` / `paused` / `saving` / `saved` / `cancelled` / `error` |
+| `current_map_name` | 当前地图名 |
+| `coverage_percent` | 覆盖率 |
+| `resolution` / `width` / `height` | 地图参数 |
+| `last_error` | 错误信息 |
+
+### 5.8 会话生命周期
+
+```
+send goal(/mapping/build, map_name)
+        |
+        v
+     mapping  <----- pause(false) -----+
+        |                              |
+   pause(true)                         |
+        v                              |
+     paused  ------- pause(false) -----+
+
+  /mapping/save  -> 写文件，build 成功结束（带路径）
+  cancel goal    -> 丢弃未保存数据，build 结束，不出文件
+```
+
+### 5.9 PCD 点云地图
+
+`/mapping/save` 保存的是 2D 栅格地图，不是 Point-LIO 原始 PCD。PCD 由 Point-LIO 的 `pcd_save.pcd_save_en` 控制，通常在 Point-LIO 正常退出时写入：
 
 ```text
 src/Point-LIO/PCD/scans.pcd
 ```
 
-如果需要保留 PCD，请结束建图时让 Point-LIO 正常退出，例如在 Point-LIO 终端按 `Ctrl+C`，等待保存完成后再关闭终端。
+如需保留 PCD，结束建图时让 Point-LIO 正常退出（终端按 `Ctrl+C`），等待保存完成再关闭。两套文件名不会自动同步。
 
-保存后可用该地图启动导航：
+保存后用新地图启动导航：
 
 ```bash
 source install/setup.bash
 ros2 launch nav indoor_navigation_launch.py map:=$(pwd)/src/bxi_nav/maps/floor_1.yaml
 ```
 
-### 10.6 HTTP 兼容接口：查询建图状态
+## 6. 地图与数据 topic
+
+### 6.1 地图数据
 
 | 项目 | 值 |
 | --- | --- |
-| HTTP | `GET /mapping/status` |
-| 用途 | 查询当前建图状态和当前地图名 |
+| Topic | `/map` |
+| 类型 | `nav_msgs/msg/OccupancyGrid` |
+| 发布源 | `nav2_map_server` |
+| 坐标系 | `map` |
+| QoS | reliable + transient_local |
 
-命令示例：
+`OccupancyGrid` 关键字段：
 
-```bash
-curl http://<机器人IP>:8088/mapping/status
-```
-
-返回示例：
-
-```json
-{
-  "state": "mapping",
-  "current_map_name": "floor_1",
-  "map_pgm_path": "src/bxi_nav/maps/floor_1.pgm",
-  "map_yaml_path": "src/bxi_nav/maps/floor_1.yaml",
-  "resolution": 0.1,
-  "width": 600,
-  "height": 600,
-  "last_error": ""
-}
-```
-
-状态含义：
-
-| 状态 | 含义 |
+| 字段 | 说明 |
 | --- | --- |
-| `idle` | 控制节点已启动，但未开始建图 |
-| `mapping` | 正在累积地图 |
-| `paused` | 已暂停地图累积 |
-| `saving` | 正在保存地图 |
-| `saved` | 地图已保存 |
-| `cancelled` | 当前建图已取消，未保存数据已清空 |
-| `error` | 出现错误，查看 `last_error` |
+| `header.frame_id` | 地图坐标系，通常为 `map` |
+| `info.resolution` | 分辨率，单位 m/cell |
+| `info.width` / `info.height` | 地图宽 / 高，单位 cell |
+| `info.origin` | 地图左下角在 `map` 下的位姿 |
+| `data` | 一维栅格数组，长度 `width * height` |
 
-### 10.7 建图保存完整流程
+栅格值：`-1` 未知，`0` 空闲，`100` 占用 / 障碍。
 
-1. 启动集成建图程序：
-
-```bash
-source install/setup.bash
-ros2 launch point_lio point_lio_with_mapping_control.launch.py
-```
-
-也可以使用一键启动：
-
-```bash
-./start.sh
-```
-
-2. 确认建图控制话题在线：
-
-```bash
-ros2 topic list | grep /mapping
-ros2 topic echo /mapping/status
-```
-
-3. 开始记录新地图：
-
-```bash
-ros2 topic pub --once /mapping/start std_msgs/msg/String "{data: 'floor_1'}"
-```
-
-4. 推动机器人完成建图路线。期间可以暂停或继续地图累积：
-
-```bash
-ros2 topic pub --once /mapping/pause std_msgs/msg/Bool "{data: true}"
-
-ros2 topic pub --once /mapping/pause std_msgs/msg/Bool "{data: false}"
-```
-
-5. 保存 2D 导航地图：
-
-```bash
-ros2 topic pub --once /mapping/save std_msgs/msg/String "{data: 'floor_1'}"
-```
-
-6. 检查输出文件：
-
-```bash
-ls src/bxi_nav/maps/floor_1.*
-```
-
-期望看到：
+坐标换算：
 
 ```text
-src/bxi_nav/maps/floor_1.pgm
-src/bxi_nav/maps/floor_1.yaml
+index = y_cell * width + x_cell
+map_x = origin.position.x + x_cell * resolution
+map_y = origin.position.y + y_cell * resolution
 ```
 
-7. 使用新地图启动导航：
+### 6.2 调试数据
 
-```bash
-source install/setup.bash
-ros2 launch nav indoor_navigation_launch.py map:=$(pwd)/src/bxi_nav/maps/floor_1.yaml
+| Topic | 类型 | 说明 |
+| --- | --- | --- |
+| `/cloud_registered` | `sensor_msgs/msg/PointCloud2` | Point-LIO 配准点云 |
+| `/terrain_map` | `sensor_msgs/msg/PointCloud2` | 地形 / 障碍点云 |
+| `/scan` | `sensor_msgs/msg/LaserScan` | 点云转 2D 激光，供 Nav2 局部代价地图使用 |
+| `/debug/path` | `nav_msgs/msg/Path` | Point-LIO 轨迹 |
+| `/debug/plan` | `nav_msgs/msg/Path` | Nav2 全局规划路径 |
+| `/debug/local_plan` | `nav_msgs/msg/Path` | 局部 A* 路径调试输出 |
+| `/debug/free_paths` | `sensor_msgs/msg/PointCloud2` | 可通行候选路径点云 |
+
+## 7. 自定义接口定义
+
+包名 `bxi_nav_interfaces`。
+
+`srv/SetInitialPose.srv`
+
+```
+float64   x
+float64   y
+float64   yaw
+float64[] covariance     # 可空，默认 0.25 / 0.0685
+---
+bool      success
+string    message
 ```
 
-8. 如果还需要保存 Point-LIO PCD 点云地图，正常退出 Point-LIO，等待生成：
+`action/NavGoto.action`
 
-```text
-src/Point-LIO/PCD/scans.pcd
+```
+# goal
+float64 x
+float64 y
+float64 yaw
+---
+# result
+bool    success
+string  message
+uint16  number_of_recoveries
+float64 total_time
+---
+# feedback
+float64 distance_remaining
+float64 estimated_time_remaining
+float64 navigation_time
+uint16  number_of_recoveries
 ```
 
-当前版本中，`/mapping/save` 生成的 `floor_1.pgm/floor_1.yaml` 和 Point-LIO 的 `scans.pcd` 是两套保存逻辑，文件名不会自动同步。
+`msg/NavPose.msg`
 
-## 11. 对接检查
+```
+std_msgs/Header     header
+float64             x
+float64             y
+float64             yaw
+geometry_msgs/Twist twist
+```
 
-联调前检查：
+`msg/NavStatus.msg`
+
+```
+std_msgs/Header header
+string  state
+float64 distance_remaining
+float64 estimated_time_remaining
+float64 navigation_time
+uint16  number_of_recoveries
+```
+
+`action/BuildMap.action`
+
+```
+# goal
+string map_name
+---
+# result
+bool    success
+string  message
+string  map_pgm_path
+string  map_yaml_path
+---
+# feedback
+string  state
+uint32  cells_known
+float32 coverage_percent
+float32 elapsed_sec
+float32 resolution
+uint32  width
+uint32  height
+```
+
+`srv/SaveMap.srv`
+
+```
+string map_name          # 可空，默认用 build 的 map_name
+---
+bool   success
+string message
+string map_pgm_path
+string map_yaml_path
+```
+
+`srv/ClearTerrain.srv`
+
+```
+float32 radius
+---
+bool    success
+string  message
+```
+
+`msg/MappingStatus.msg`
+
+```
+std_msgs/Header header
+string  state
+string  current_map_name
+float32 coverage_percent
+float32 resolution
+uint32  width
+uint32  height
+string  last_error
+```
+
+## 8. QoS 说明
+
+ROS 2 中 QoS 不匹配会导致收不到数据且无报错，App 侧需按下表匹配。
+
+| Topic | QoS |
+| --- | --- |
+| `/map` | reliable + transient_local |
+| `/nav/pose` | reliable + transient_local |
+| `/nav/status` | reliable + transient_local |
+| `/mapping/status` | reliable + transient_local |
+| `/scan` | best_effort |
+| `/cloud_registered`、`/terrain_map`、`/debug/*` | best_effort |
+
+rosbridge 订阅 latched topic 后会立即收到最近一帧，无需轮询。
+
+## 9. 对接检查
 
 ```bash
 source install/setup.bash
 ros2 node list
 ros2 topic list
+ros2 service list
 ros2 action list
 ros2 topic echo --once /map --field info
-ros2 topic echo --once /aft_mapped_to_init
-ros2 action info /navigate_to_pose
-ros2 topic list | grep /mapping
-ros2 topic echo /mapping/status
+ros2 topic echo --once /nav/pose
+ros2 action info /nav/goto
+ros2 action info /mapping/build
 ```
 
 关键条件：
@@ -581,18 +441,15 @@ ros2 topic echo /mapping/status
 | 检查项 | 期望 |
 | --- | --- |
 | `/cloud_registered` | 持续发布 |
-| `/aft_mapped_to_init` | 持续发布 |
+| `/nav/pose` | 持续发布 |
 | `/map` | 可读取地图信息 |
-| `/navigate_to_pose` | action 存在 |
-| `/mapping/start` | topic 存在，类型为 `std_msgs/msg/String` |
-| `/mapping/pause` | topic 存在，类型为 `std_msgs/msg/Bool` |
-| `/mapping/cancel` | topic 存在，类型为 `std_msgs/msg/Empty` |
-| `/mapping/save` | topic 存在，类型为 `std_msgs/msg/String` |
-| `/mapping/status` | 持续发布 JSON 状态 |
+| `/nav/goto` | action 存在 |
+| `/mapping/build` | action 存在 |
+| rosbridge | `ws://<机器人IP>:9090` 可连接 |
 | TF | `map -> odom -> base_link` 连通 |
 
-## 11. 当前说明
+## 10. 说明
 
-1. 本文档只列当前 ROS 2 接口。
-2. `src/bxi_nav/src/main.cpp` 当前只是占位订阅节点，不是 App 对接服务。
-3. 当前导航目标发送依赖 Nav2 标准 action `/navigate_to_pose`。
+1. 本文档只列当前 ROS 2 接口，HTTP 接口已废弃。
+2. `/nav` 和 `/mapping` 下的接口由网关节点提供，对外屏蔽 Nav2 原始接口。
+3. 导航底层仍为 Nav2 标准 action `/navigate_to_pose`。

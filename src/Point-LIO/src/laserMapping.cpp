@@ -10,10 +10,13 @@
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <timing_utils.h>
 
 #include <algorithm>
 #include <filesystem>
+#include <mutex>
 #include <unordered_map>
 
 #include "li_initialization.h"
@@ -239,6 +242,9 @@ static constexpr int kMinStaticObservations = 8;
 static constexpr int kMinStaticObservationSpanFrames = 30;
 static std::unordered_map<StaticVoxelKey, StaticVoxelCell, StaticVoxelKeyHash> static_map_voxels;
 static int static_map_frame_index = 0;
+static std::mutex pcd_save_mutex;
+static bool app_mapping_active = false;
+static bool app_mapping_paused = false;
 
 StaticVoxelKey makeStaticVoxelKey(const PointType & point)
 {
@@ -305,6 +311,13 @@ PointCloudXYZI::Ptr buildStaticMapCloud()
   return cloud;
 }
 
+void resetPcdSaveCloud()
+{
+  pcl_wait_save->clear();
+  static_map_voxels.clear();
+  static_map_frame_index = 0;
+}
+
 void accumulatePcdSaveCloud(const PointCloudXYZI & cloud)
 {
   if (pcd_save_filter_en) {
@@ -338,6 +351,27 @@ bool saveScansPcd(const PointCloudXYZI & cloud)
   }
 }
 
+bool saveCurrentPcdMap(std::string * message)
+{
+  PointCloudXYZI::Ptr pcd_cloud = buildPcdSaveCloud();
+  if (pcd_cloud->empty()) {
+    if (message) {
+      *message = "no points to save";
+    }
+    return false;
+  }
+  if (!saveScansPcd(*pcd_cloud)) {
+    if (message) {
+      *message = "failed to write src/Point-LIO/PCD/scans.pcd";
+    }
+    return false;
+  }
+  if (message) {
+    *message = "saved src/Point-LIO/PCD/scans.pcd";
+  }
+  return true;
+}
+
 void publish_frame_world(
   const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFullRes)
 {
@@ -356,11 +390,9 @@ void publish_frame_world(
   // 1. make sure you have enough memories
   // 2. noted that pcd save will influence the real-time performances
   if (pcd_save_en) {
-    accumulatePcdSaveCloud(*map_cloud);
-    PointCloudXYZI::Ptr pcd_cloud = buildPcdSaveCloud();
-
-    if (pcd_save_filter_en && !pcd_cloud->empty()) {
-      saveScansPcd(*pcd_cloud);
+    std::lock_guard<std::mutex> lock(pcd_save_mutex);
+    if (app_mapping_active && !app_mapping_paused) {
+      accumulatePcdSaveCloud(*map_cloud);
     }
   }
 }
@@ -534,6 +566,61 @@ int main(int argc, char ** argv)
   auto pub_odom_aft_mapped =
     nh->create_publisher<nav_msgs::msg::Odometry>("aft_mapped_to_init", 1000);
   auto pub_path = nh->create_publisher<nav_msgs::msg::Path>("path", 1000);
+  auto mapping_start_srv = nh->create_service<std_srvs::srv::Trigger>("/point_lio/mapping/start",
+    [](
+      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+      std::lock_guard<std::mutex> lock(pcd_save_mutex);
+      if (!pcd_save_en) {
+        response->success = false;
+        response->message = "pcd_save.pcd_save_en is false";
+        return;
+      }
+      resetPcdSaveCloud();
+      app_mapping_active = true;
+      app_mapping_paused = false;
+      response->success = true;
+      response->message = "Point-LIO mapping accumulation started";
+    });
+  auto mapping_pause_srv = nh->create_service<std_srvs::srv::SetBool>("/point_lio/mapping/pause",
+    [](
+      const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+      std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+      std::lock_guard<std::mutex> lock(pcd_save_mutex);
+      if (!app_mapping_active) {
+        response->success = false;
+        response->message = "no active Point-LIO mapping accumulation";
+        return;
+      }
+      app_mapping_paused = request->data;
+      response->success = true;
+      response->message = app_mapping_paused ? "Point-LIO mapping paused" :
+        "Point-LIO mapping resumed";
+    });
+  auto mapping_save_srv = nh->create_service<std_srvs::srv::Trigger>("/point_lio/mapping/save",
+    [](
+      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+      std::lock_guard<std::mutex> lock(pcd_save_mutex);
+      std::string message;
+      response->success = saveCurrentPcdMap(&message);
+      response->message = message;
+      if (response->success) {
+        app_mapping_active = false;
+        app_mapping_paused = false;
+      }
+    });
+  auto mapping_cancel_srv = nh->create_service<std_srvs::srv::Trigger>("/point_lio/mapping/cancel",
+    [](
+      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+      std::lock_guard<std::mutex> lock(pcd_save_mutex);
+      resetPcdSaveCloud();
+      app_mapping_active = false;
+      app_mapping_paused = false;
+      response->success = true;
+      response->message = "Point-LIO mapping accumulation cancelled";
+    });
   auto tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
 
   //------------------------------------------------------------------------------------------------------
@@ -1170,11 +1257,12 @@ int main(int argc, char ** argv)
   /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
   if (pcd_save_en) {
-    PointCloudXYZI::Ptr pcd_cloud = buildPcdSaveCloud();
-    if (!pcd_cloud->empty()) {
-      saveScansPcd(*pcd_cloud);
-    } else {
-      RCLCPP_WARN(LOGGER, "No points to save.");
+    std::lock_guard<std::mutex> lock(pcd_save_mutex);
+    if (app_mapping_active) {
+      std::string message;
+      if (!saveCurrentPcdMap(&message)) {
+        RCLCPP_WARN(LOGGER, "%s", message.c_str());
+      }
     }
   }
   fout_out.close();

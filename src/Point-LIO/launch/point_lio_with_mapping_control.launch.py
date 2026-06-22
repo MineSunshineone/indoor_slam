@@ -7,7 +7,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    remappings = [("/tf", "tf"), ("/tf_static", "tf_static")]
+    remappings = [("/tf", "tf"), ("/tf_static", "tf_static"), ("path", "/debug/path")]
 
     namespace = LaunchConfiguration("namespace")
     use_rviz = LaunchConfiguration("rviz")
@@ -21,6 +21,10 @@ def generate_launch_description():
     mapping_origin_x = LaunchConfiguration("mapping_origin_x")
     mapping_origin_y = LaunchConfiguration("mapping_origin_y")
     mapping_status_period = LaunchConfiguration("mapping_status_period")
+    pcd2pgm_executable = LaunchConfiguration("pcd2pgm_executable")
+    pcd2pgm_config = LaunchConfiguration("pcd2pgm_config")
+    mapping_pcd_input_path = LaunchConfiguration("mapping_pcd_input_path")
+    relocalization_pcd_path = LaunchConfiguration("relocalization_pcd_path")
 
     point_lio_dir = get_package_share_directory("point_lio")
 
@@ -82,6 +86,26 @@ def generate_launch_description():
         default_value="1.0",
         description="Seconds between /mapping/status publications",
     )
+    declare_pcd2pgm_executable = DeclareLaunchArgument(
+        "pcd2pgm_executable",
+        default_value="pcd2pgm_headless",
+        description="Executable used to convert Point-LIO PCD into Nav2 map files",
+    )
+    declare_pcd2pgm_config = DeclareLaunchArgument(
+        "pcd2pgm_config",
+        default_value="scans_nav2_map.cfg",
+        description="pcd2pgm_headless config file",
+    )
+    declare_mapping_pcd_input_path = DeclareLaunchArgument(
+        "mapping_pcd_input_path",
+        default_value="src/Point-LIO/PCD/scans.pcd",
+        description="Point-LIO PCD file converted when /mapping/save is called",
+    )
+    declare_relocalization_pcd_path = DeclareLaunchArgument(
+        "relocalization_pcd_path",
+        default_value="maps/PCD/scans.pcd",
+        description="Edited PCD output used by small_gicp relocalization",
+    )
 
     start_point_lio_node = Node(
         package="point_lio",
@@ -116,6 +140,14 @@ def generate_launch_description():
             mapping_origin_y,
             "--status-period",
             mapping_status_period,
+            "--pcd2pgm-executable",
+            pcd2pgm_executable,
+            "--pcd2pgm-config",
+            pcd2pgm_config,
+            "--pcd-input-path",
+            mapping_pcd_input_path,
+            "--relocalization-pcd-path",
+            relocalization_pcd_path,
         ],
     )
 
@@ -147,6 +179,10 @@ def generate_launch_description():
             declare_mapping_origin_x,
             declare_mapping_origin_y,
             declare_mapping_status_period,
+            declare_pcd2pgm_executable,
+            declare_pcd2pgm_config,
+            declare_mapping_pcd_input_path,
+            declare_relocalization_pcd_path,
             start_point_lio_node,
             start_mapping_control_node,
             start_rviz_node,

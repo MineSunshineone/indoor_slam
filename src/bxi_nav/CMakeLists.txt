@@ -42,6 +42,7 @@ ament_target_dependencies(indoor_nav_goal
   std_srvs
   tf2
   tf2_geometry_msgs
+  tf2_ros
 )
 
 ament_target_dependencies(terrain_analysis

@@ -224,7 +224,7 @@ controller_server:
       # local_costmap 中大于等于该值的栅格视为不可通行。
       local_costmap_lethal_cost: 253
       # local_costmap 局部 A* 路径发布话题。
-      local_costmap_path_topic: /local_plan
+      local_costmap_path_topic: /debug/local_plan
       # 是否允许选择倒车方向的局部路径。
       two_way_drive: False
       # 是否检查会阻碍原地旋转的障碍物。
@@ -256,7 +256,7 @@ controller_server:
       # 是否发布可通行候选路径的可视化点云。
       visualize_free_paths: True
       # 可通行候选路径可视化点云的话题。
-      free_paths_topic: /free_paths
+      free_paths_topic: /debug/free_paths
       # 是否发布碰撞检测实际使用的障碍点云（用于调试）。
       visualize_obstacle_cloud: True
       # 障碍点云调试话题；intensity=1.0 表示点在 footprint 内，0.5 表示在路径上。

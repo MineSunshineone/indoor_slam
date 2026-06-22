@@ -55,8 +55,9 @@ tmux send-keys -t $SESSION:0.1 "export ROS_DOMAIN_ID=37 && source install/setup.
 tmux send-keys -t $SESSION:0.3 "export ROS_DOMAIN_ID=37 && source install/setup.bash && ros2 launch nav indoor_navigation_launch.py" C-m
 
 # App 接入网关：rosbridge websocket，App 通过 ws://机器人IP:9090 访问 ROS topic/service/action。
-tmux new-window -d -t $SESSION -n "App网关"
-tmux send-keys -t $SESSION:1 "export ROS_DOMAIN_ID=37 && source install/setup.bash && if ros2 pkg prefix rosbridge_server >/dev/null 2>&1; then ros2 launch rosbridge_server rosbridge_websocket_launch.xml; else echo 'rosbridge_server 未安装，请先安装 ros-humble-rosbridge-server'; bash; fi" C-m
+APP_WINDOW="App网关"
+tmux new-window -d -t "$SESSION:" -n "$APP_WINDOW"
+tmux send-keys -t "$SESSION:$APP_WINDOW" "export ROS_DOMAIN_ID=37 && source install/setup.bash && if ros2 pkg prefix rosbridge_server >/dev/null 2>&1; then ros2 launch rosbridge_server rosbridge_websocket_launch.xml; else echo 'rosbridge_server 未安装，请先安装 ros-humble-rosbridge-server'; bash; fi" C-m
 
 # 打开会话并聚焦在左上角
 tmux select-window -t $SESSION:0
