@@ -8,6 +8,7 @@ App 通过 ROS 2 action/service/topic 控制地图累积流程：开始、暂停
 from __future__ import annotations
 
 import argparse
+import array
 import json
 import re
 import subprocess
@@ -294,6 +295,19 @@ class MappingSession:
         grid[occ] = 0
         return grid
 
+    def occupancy_cells(self) -> np.ndarray:
+        """当前累积栅格转成 Nav2 OccupancyGrid 语义 (int8): -1 未知 / 0 空闲 / 100 占用。
+
+        行 0 对应 origin_y（行主序，y 向上递增），与 OccupancyGrid.data 布局一致，
+        无需上下翻转（PGM 才需要翻）。
+        """
+        with self.lock:
+            grid = self._build_grid()
+        cells = np.full(grid.shape, -1, dtype=np.int8)
+        cells[grid == 254] = 0
+        cells[grid == 0] = 100
+        return cells
+
     def _grid_metrics(self) -> tuple[int, float]:
         # 统计最终栅格中已知区域比例，和保存出来的 PGM 语义保持一致。
         grid = self._build_grid()
@@ -406,6 +420,7 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
     from bxi_nav_interfaces.action import BuildMap
     from bxi_nav_interfaces.msg import MappingStatus
     from bxi_nav_interfaces.srv import SaveMap
+    from nav_msgs.msg import OccupancyGrid
     from rclpy.action import ActionServer, CancelResponse, GoalResponse
     from rclpy.callback_groups import ReentrantCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
@@ -439,6 +454,13 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
                 durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
             )
             self.status_pub = self.create_publisher(MappingStatus, "/mapping/status", status_qos)
+            # 实时建图栅格 → /map（App 建图画面靠它，接口契约 §6.1/§8 要求
+            # reliable + transient_local，volatile 会被网关的订阅静默不兼容）。
+            # 仅在建图会话活跃时发布（1Hz，随 status 定时器），会话结束即销毁
+            # 发布器——把 latched 帧从 DDS 撤掉，避免与 nav2 map_server 的静态
+            # 先验图在 /map 上双 latch 打架。
+            self.map_qos = status_qos
+            self.map_pub = None
             self.create_subscription(PointCloud2, args.cloud_topic, self.on_cloud, cloud_qos)
             self.build_server = ActionServer(self, BuildMap, "/mapping/build",
                 execute_callback=self.execute_build,
@@ -605,6 +627,29 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             status_msg.height = int(data["height"])
             status_msg.last_error = str(data["last_error"])
             self.status_pub.publish(status_msg)
+            self.publish_live_map(str(data["state"]))
+
+        def publish_live_map(self, state: str) -> None:
+            # 建图/暂停/保存中把累积栅格发出去；其余状态销毁发布器撤掉 latch。
+            if state in ("mapping", "paused", "saving"):
+                if self.map_pub is None:
+                    self.map_pub = self.create_publisher(
+                        OccupancyGrid, args.map_topic, self.map_qos)
+                msg = OccupancyGrid()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = "map"
+                msg.info.resolution = float(session.config.resolution)
+                msg.info.width = session.width
+                msg.info.height = session.height
+                msg.info.origin.position.x = float(session.config.origin_x)
+                msg.info.origin.position.y = float(session.config.origin_y)
+                msg.info.origin.orientation.w = 1.0
+                # array('b') 直接吃 numpy int8 字节，绕过 36 万格的 Python 列表转换。
+                msg.data = array.array("b", session.occupancy_cells().tobytes())
+                self.map_pub.publish(msg)
+            elif self.map_pub is not None:
+                self.destroy_publisher(self.map_pub)
+                self.map_pub = None
 
         def _call_point_lio_trigger(self, client, action_name: str) -> str:
             return self._call_point_lio_service(client, Trigger.Request(), action_name)
@@ -685,6 +730,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 这些参数也会由 launch 文件透传，便于现场按地图范围和高度带调参。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cloud-topic", default="/cloud_registered")
+    parser.add_argument("--map-topic", default="/map",
+                        help="建图期间实时占用栅格的发布话题 (latched, 1Hz)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=8088, type=int)
     parser.add_argument("--output-dir", default="src/bxi_nav/maps", type=Path)
