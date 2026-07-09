@@ -55,6 +55,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 : Node("small_gicp_relocalization", options),
   initial_pose_received_(false),
   has_global_map_msg_(false),
+  last_published_reloc_required_(true),
+  last_accepted_time_(0, 0, RCL_ROS_TIME),
   result_t_(Eigen::Isometry3d::Identity()),
   previous_result_t_(Eigen::Isometry3d::Identity())
 {
@@ -69,6 +71,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_translation_update", 1.0);
   this->declare_parameter("max_rotation_update_deg", 20.0);
   this->declare_parameter("require_initial_pose", false);
+  this->declare_parameter("localized_timeout", 10.0);
   this->declare_parameter("map_frame", "map");
   this->declare_parameter("odom_frame", "odom");
   this->declare_parameter("base_frame", "");
@@ -89,6 +92,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("max_translation_update", max_translation_update_);
   this->get_parameter("max_rotation_update_deg", max_rotation_update_);
   this->get_parameter("require_initial_pose", require_initial_pose_);
+  this->get_parameter("localized_timeout", localized_timeout_);
   this->get_parameter("map_frame", map_frame_);
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("base_frame", base_frame_);
@@ -126,6 +130,15 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   aligned_scan_pub_ =
     this->create_publisher<sensor_msgs::msg::PointCloud2>("relocalization/aligned_scan", 10);
 
+  // 定位健康度信号: true=需要重定位。App 网关 (bxi_rc_ros2) 订阅后转发成
+  // WS `nav.reloc_required`, App 以此为权威判定 (代替"收到 pose 流就算已定位")。
+  // "已定位"标准 = 收到过 /initialpose 且最近 localized_timeout 秒内至少一次
+  // "被接受的 GICP 更新" (converged + 内点率/fitness/步长全部过门槛)。
+  // transient_local 让晚起的网关立即拿到当前值; 定时器 1Hz 周期重发, 保证
+  // 中途重连的 WS 客户端也能在 1 秒内收敛。
+  reloc_required_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+    "/nav/reloc_required", rclcpp::QoS(1).reliable().transient_local());
+
   loadGlobalMap(prior_pcd_file_);
 
   // Downsample points and convert them into pcl::PointCloud<pcl::PointCovariance>
@@ -158,6 +171,28 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   global_map_timer_ = this->create_wall_timer(
     std::chrono::milliseconds(1000), std::bind(&SmallGicpRelocalizationNode::publishGlobalMap, this));
+
+  reloc_state_timer_ = this->create_wall_timer(
+    std::chrono::milliseconds(1000),
+    std::bind(&SmallGicpRelocalizationNode::publishRelocState, this));
+}
+
+void SmallGicpRelocalizationNode::publishRelocState()
+{
+  // nanoseconds()==0 = 从未有过被接受的更新 (或刚被 /initialpose 重置),
+  // 先判空再做减法, 避免与默认构造的 Time 混用时钟类型抛异常。
+  const bool fix_fresh = last_accepted_time_.nanoseconds() != 0 &&
+                         (this->now() - last_accepted_time_).seconds() < localized_timeout_;
+  const bool required = !(initial_pose_received_ && fix_fresh);
+  if (required != last_published_reloc_required_) {
+    RCLCPP_INFO(
+      this->get_logger(), "Relocalization state -> %s",
+      required ? "RELOC REQUIRED" : "LOCALIZED");
+    last_published_reloc_required_ = required;
+  }
+  std_msgs::msg::Bool msg;
+  msg.data = required;
+  reloc_required_pub_->publish(msg);
 }
 
 void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
@@ -298,6 +333,10 @@ void SmallGicpRelocalizationNode::performRegistration()
   }
 
   result_t_ = previous_result_t_ = result.T_target_source;
+  // "被接受的更新"即定位成功的权威证据 (匹配点数/内点率已过门槛),
+  // 刷新时间戳并立即广播, App 端重定位确认后 ~1 个配准周期内就能看到"已定位"。
+  last_accepted_time_ = this->now();
+  publishRelocState();
 
   pcl::PointCloud<pcl::PointXYZ> source_xyz;
   source_xyz.reserve(source_->size());
@@ -372,6 +411,11 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
 
     initial_pose_received_ = true;
     previous_result_t_ = result_t_ = map_to_odom;
+    // 重置定位健康度: 用户刚设的位姿还没被扫描匹配验证过, 先回到"未定位",
+    // 等下一次被接受的 GICP 更新 (通常 <1s) 再翻成"已定位" — 匹配不上就一直
+    // 保持"需要重定位", App 端能如实看到这次重定位没有成功。
+    last_accepted_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    publishRelocState();
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN(
       this->get_logger(), "Could not transform initial pose from %s to %s: %s",

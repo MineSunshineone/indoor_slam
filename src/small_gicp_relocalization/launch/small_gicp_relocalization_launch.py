@@ -58,6 +58,9 @@ def generate_launch_description():
                 "max_rotation_update_deg": 20.0,
                 # 为 true 时，收到 /initialpose 后才接受 GICP 校正更新。
                 "require_initial_pose": True,
+                # 定位健康度 (/nav/reloc_required, true=需要重定位) 的超时:
+                # 最近一次"被接受的 GICP 更新"距今超过该秒数即视为未定位。
+                "localized_timeout": 10.0,
                 # 本节点发布校正 TF 的父坐标系。
                 "map_frame": "map",
                 # 本节点发布校正 TF 的子坐标系。

@@ -23,6 +23,7 @@
 #include "pcl/io/pcd_io.h"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "small_gicp/ann/kdtree_omp.hpp"
 #include "small_gicp/factors/gicp_factor.hpp"
 #include "small_gicp/pcl/pcl_point.hpp"
@@ -46,6 +47,7 @@ private:
   void performRegistration();
   void publishTransform();
   void publishGlobalMap();
+  void publishRelocState();
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
@@ -64,6 +66,10 @@ private:
   bool require_initial_pose_;
   bool initial_pose_received_;
   bool has_global_map_msg_;
+  // 定位健康度: 最近一次"被接受的 GICP 更新"距今超过该秒数即视为未定位。
+  double localized_timeout_;
+  bool last_published_reloc_required_;
+  rclcpp::Time last_accepted_time_;
   std::vector<double> init_pose_;
 
   std::string map_frame_;
@@ -93,6 +99,7 @@ private:
   rclcpp::TimerBase::SharedPtr transform_timer_;
   rclcpp::TimerBase::SharedPtr register_timer_;
   rclcpp::TimerBase::SharedPtr global_map_timer_;
+  rclcpp::TimerBase::SharedPtr reloc_state_timer_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -101,6 +108,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_scan_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_scan_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr reloc_required_pub_;
   sensor_msgs::msg::PointCloud2 global_map_msg_;
 };
 
