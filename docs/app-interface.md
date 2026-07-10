@@ -1,17 +1,18 @@
 # Indoor SLAM App 对接接口文档
 
-本文档列出 App 侧对接所需的全部 ROS 2 接口。导航和建图分别收敛在 `/nav` 和 `/mapping` 两个命名空间下，不再使用 HTTP。
+本文档列出 SLAM 与机器人网关之间的 ROS 2 接口。正式 App 不直接连接 DDS/rosbridge，
+而是通过 `bxi_rc_ros2` 提供的 HMAC REST 与 WebSocket 接口访问这些能力。
 
 ## 1. 基础信息
 
 | 项目 | 值 |
 | --- | --- |
 | ROS 版本 | ROS 2 Humble |
-| 默认 ROS_DOMAIN_ID | `37` |
+| 默认 ROS_DOMAIN_ID | `22`（必须与 `bxi_rc_ros2` 一致） |
 | 主坐标系 | `map` |
 | 里程计坐标系 | `odom` |
 | 机器人坐标系 | `base_link` |
-| 默认地图 | `src/bxi_nav/maps/maps.yaml` |
+| 默认地图 | 无；开机处于 `idle`，收到 App 请求后才加载地图 |
 | 自定义接口包 | `bxi_nav_interfaces` |
 
 启动完整系统：
@@ -20,31 +21,27 @@
 ./start.sh
 ```
 
-手动启动导航：
+手动启动静默主管：
 
 ```bash
 source install/setup.bash
-ros2 launch nav indoor_navigation_launch.py
+ros2 launch bxi_slam_manager quiet_bringup.launch.py
 ```
 
 ## 2. App 接入方式
 
-App 不需要安装 ROS 或 DDS。系统在机器人上运行 `rosbridge_server`，App 通过 websocket + JSON 访问所有接口。
+App 不需要安装 ROS 或 DDS。App 使用机器人网关的 `/api/v1/*` REST 与已鉴权
+WebSocket；网关再调用本文列出的 ROS 接口。
 
 | 项目 | 值 |
 | --- | --- |
-| 地址 | `ws://<机器人IP>:9090` |
-| 协议 | rosbridge v2（JSON） |
-| 可访问 | topic / service / action |
+| REST | `http://<机器人IP>:8082/api/v1/*` |
+| WebSocket | 由 `bxi_rc_ros2` 网关提供的鉴权连接 |
+| 鉴权 | 与控制链路一致的 HMAC |
 
-JSON 操作对应关系：
-
-| 接口种类 | 调用方式 | rosbridge op |
-| --- | --- | --- |
-| service | 调用并等回执 | `call_service` |
-| topic | 订阅推送 | `subscribe` |
-| action | 发目标、收反馈 | `send_action_goal` |
-| action | 取消目标 | `cancel_action_goal` |
+关键 App 接口包括 `PUT /runtime/mode`、`GET /runtime/status`、
+`POST /maps/{id}/activate`、`POST /mapping/start|save`；运行状态通过
+`nav.runtime.status` 推送。
 
 ## 3. 命名空间约定
 
@@ -52,9 +49,18 @@ JSON 操作对应关系：
 | --- | --- |
 | `/nav` | 导航相关 |
 | `/mapping` | 建图相关 |
+| `/slam/runtime` | 静默启动与算法模式主管 |
 | 顶层 | 地图数据和标准 topic（`/map`、`/scan` 等） |
 
 Nav2 内部仍使用标准接口名（`/navigate_to_pose`、`/initialpose` 等）。`/nav` 下的接口由网关节点转译，App 只对接 `/nav` 即可，不直接接触 Nav2 原始接口。
+
+### 3.1 运行模式
+
+`/slam/runtime/set_mode` 接受 `idle`、`new_mapping`、`navigation` 和
+`extend_mapping`。`navigation`/`extend_mapping` 必须同时提供版本化地图的
+`map.pcd` 与 `map.yaml`。主管通过 `/slam/runtime/status` 发布当前模式、目标模式、
+活动地图、雷达健康状态及 3D GICP 质量。进入导航模式后先处于 `localizing`，
+只有 `localized=true` 时网关才接受导航或巡游目标。
 
 ## 4. 导航接口
 
@@ -152,11 +158,12 @@ ros2 topic echo --once /nav/pose
 
 ### 5.2 开始建图
 
-发 `/mapping/build` 目标即开始累积，goal 持续活跃表示会话进行中。建图进度通过 action feedback 推送。
+新建地图时主管先进入 `new_mapping`；续建时先用父地图 PCD 完成 3D 重定位，
+再发 `/mapping/build` 目标开始累积。goal 持续活跃表示会话进行中。
 
 ```bash
 ros2 action send_goal /mapping/build bxi_nav_interfaces/action/BuildMap \
-  "{map_name: 'floor_1'}" --feedback
+  "{map_name: 'floor_1', session_id: 'session-1', base_map_id: ''}" --feedback
 ```
 
 feedback 字段：
@@ -235,20 +242,18 @@ send goal(/mapping/build, map_name)
 
 ### 5.9 PCD 点云地图
 
-`/mapping/save` 保存的是 2D 栅格地图，不是 Point-LIO 原始 PCD。PCD 由 Point-LIO 的 `pcd_save.pcd_save_en` 控制，通常在 Point-LIO 正常退出时写入：
+`/mapping/save` 同时输出 PCD、PGM 和 YAML。网关将其原子提交为版本化 bundle：
 
 ```text
-src/Point-LIO/PCD/scans.pcd
+/var/lib/bxi/maps/<id>/manifest.json
+/var/lib/bxi/maps/<id>/map.pcd
+/var/lib/bxi/maps/<id>/map.pgm
+/var/lib/bxi/maps/<id>/map.yaml
 ```
 
-如需保留 PCD，结束建图时让 Point-LIO 正常退出（终端按 `Ctrl+C`），等待保存完成再关闭。两套文件名不会自动同步。
-
-保存后用新地图启动导航：
-
-```bash
-source install/setup.bash
-ros2 launch nav indoor_navigation_launch.py map:=$(pwd)/src/bxi_nav/maps/floor_1.yaml
-```
+续建不会覆盖父图，而是创建带 `parent_id` 和递增 `revision` 的子版本，并继承
+waypoints、regions 与 topology 快照。只有旧二维栅格、缺少独立 PCD 的地图仍可展示，
+但不能激活导航或续建。
 
 ## 6. 地图与数据 topic
 
@@ -357,12 +362,15 @@ uint16  number_of_recoveries
 ```
 # goal
 string map_name
+string session_id
+string base_map_id
 ---
 # result
 bool    success
 string  message
 string  map_pgm_path
 string  map_yaml_path
+string  map_pcd_path
 ---
 # feedback
 string  state
@@ -383,6 +391,7 @@ bool   success
 string message
 string map_pgm_path
 string map_yaml_path
+string map_pcd_path
 ```
 
 `srv/ClearTerrain.srv`
@@ -405,7 +414,13 @@ float32 resolution
 uint32  width
 uint32  height
 string  last_error
+string  session_id
+string  base_map_id
 ```
+
+`msg/RuntimeStatus.msg` 发布 `current_mode`、`desired_mode`、`transition_id`、
+`active_map_id`、`localized`、`fitness_score`、`inlier_ratio`、`driver_healthy`
+和 `last_error`。`msg/RelocalizationStatus.msg` 是 GICP 的三维定位质量输入。
 
 ## 8. QoS 说明
 
@@ -417,10 +432,11 @@ ROS 2 中 QoS 不匹配会导致收不到数据且无报错，App 侧需按下�
 | `/nav/pose` | reliable + transient_local |
 | `/nav/status` | reliable + transient_local |
 | `/mapping/status` | reliable + transient_local |
+| `/slam/runtime/status` | reliable + transient_local |
 | `/scan` | best_effort |
 | `/cloud_registered`、`/terrain_map`、`/debug/*` | best_effort |
 
-rosbridge 订阅 latched topic 后会立即收到最近一帧，无需轮询。
+网关订阅 latched topic 后会立即收到最近一帧，无需等待下一次状态变化。
 
 ## 9. 对接检查
 
@@ -434,6 +450,7 @@ ros2 topic echo --once /map --field info
 ros2 topic echo --once /nav/pose
 ros2 action info /nav/goto
 ros2 action info /mapping/build
+ros2 topic echo --once /slam/runtime/status
 ```
 
 关键条件：
@@ -445,11 +462,11 @@ ros2 action info /mapping/build
 | `/map` | 可读取地图信息 |
 | `/nav/goto` | action 存在 |
 | `/mapping/build` | action 存在 |
-| rosbridge | `ws://<机器人IP>:9090` 可连接 |
+| 运行时状态 | `driver_healthy=true`，导航前 `localized=true` |
 | TF | `map -> odom -> base_link` 连通 |
 
 ## 10. 说明
 
-1. 本文档只列当前 ROS 2 接口，HTTP 接口已废弃。
-2. `/nav` 和 `/mapping` 下的接口由网关节点提供，对外屏蔽 Nav2 原始接口。
+1. 本文档中的 ROS 2 接口用于 SLAM 与 `bxi_rc_ros2` 网关内部对接。
+2. App 使用网关 REST/WS，不直接调用 ROS action/service。
 3. 导航底层仍为 Nav2 标准 action `/navigate_to_pose`。

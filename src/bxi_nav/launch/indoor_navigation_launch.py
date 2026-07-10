@@ -15,11 +15,6 @@ def generate_launch_description():
     autostart = LaunchConfiguration('autostart')
     rviz = LaunchConfiguration('rviz')
     nav_share_dir = get_package_share_directory('nav')
-    default_map_file = os.path.join(
-        nav_share_dir,
-        'maps',
-        'maps.yaml'
-    )
     default_params_file = os.path.join(
         nav_share_dir,
         'config',
@@ -38,8 +33,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'map',
-            default_value=default_map_file,
-            description='Full path to the 2D occupancy map yaml'
+            default_value='',
+            description='Required full path to the selected 2D occupancy map yaml'
         ),
         DeclareLaunchArgument(
             'params_file',
@@ -53,7 +48,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'autostart',
-            default_value='true',
+            default_value='false',
             description='Automatically transition Nav2 lifecycle nodes'
         ),
         DeclareLaunchArgument(

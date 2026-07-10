@@ -33,6 +33,36 @@ def sanitize_map_name(map_name: str) -> str:
     return cleaned
 
 
+def apply_rigid_transform(
+    xyz: np.ndarray,
+    *,
+    translation: tuple[float, float, float],
+    quaternion: tuple[float, float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a map<-cloud rigid transform to an Nx3 point array."""
+    qx, qy, qz, qw = quaternion
+    norm = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not np.isfinite(norm) or norm < 1e-12:
+        raise ValueError("transform quaternion is invalid")
+    qx, qy, qz, qw = qx / norm, qy / norm, qz / norm, qw / norm
+    rotation = np.array(
+        [
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw),
+             2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz),
+             2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw),
+             1 - 2 * (qx * qx + qy * qy)],
+        ],
+        dtype=np.float64,
+    )
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = np.asarray(translation, dtype=np.float64)
+    transformed = np.asarray(xyz, dtype=np.float64) @ rotation.T + matrix[:3, 3]
+    return transformed, matrix
+
+
 @dataclass
 class MappingConfig:
     """建图输出和点云投影参数。"""
@@ -61,6 +91,8 @@ class MappingConfig:
     pcd2pgm_config: Path = Path("scans_nav2_map.cfg")
     pcd_input_path: Path = Path("src/Point-LIO/PCD/scans.pcd")
     relocalization_pcd_path: Path = Path("maps/PCD/scans.pcd")
+    map_store_root: Path = Path("/var/lib/bxi/maps")
+    pcd_merge_executable: Path = Path("merge_pcd_maps")
 
 
 class MappingSession:
@@ -81,19 +113,34 @@ class MappingSession:
         # 状态取值：idle/mapping/paused/saving/saved/cancelled。
         self.state = "idle"
         self.current_map_name = ""
+        self.session_id = ""
+        self.base_map_id = ""
         self.last_error = ""
         self.last_map_pgm_path = ""
         self.last_map_yaml_path = ""
         self.last_relocalization_pcd_path = ""
+        self.map_from_cloud = np.eye(4, dtype=np.float64)
+        self.base_cells: np.ndarray | None = None
         # 分别累计障碍物证据和空闲证据；保存时再融合成 Nav2 占据栅格。
         self.occ_counts = np.zeros((self.height, self.width), dtype=np.uint32)
         self.free_counts = np.zeros((self.height, self.width), dtype=np.uint32)
 
-    def start(self, map_name: str) -> dict[str, Any]:
+    def start(
+        self,
+        map_name: str,
+        session_id: str = "",
+        base_map_id: str = "",
+    ) -> dict[str, Any]:
         with self.lock:
             # 开始新地图时清空未保存的旧累积结果，避免两次建图混在一起。
             self.current_map_name = sanitize_map_name(map_name)
-            self._clear_counts()
+            self.session_id = session_id.strip()
+            self.base_map_id = base_map_id.strip()
+            if self.base_map_id:
+                sanitize_map_name(self.base_map_id)
+                self._seed_from_parent_grid()
+            else:
+                self._clear_counts()
             self.state = "mapping"
             self.last_error = ""
             return self.status()
@@ -125,6 +172,8 @@ class MappingSession:
                 return
 
             cfg = self.config
+            if self.base_map_id:
+                self._expand_to_include(xyz)
             # 将米制 x/y 坐标转换为固定输出栅格里的列/行索引。
             ix = np.floor((xyz[:, 0] - cfg.origin_x) / cfg.resolution).astype(np.int64)
             iy = np.floor((xyz[:, 1] - cfg.origin_y) / cfg.resolution).astype(np.int64)
@@ -138,6 +187,81 @@ class MappingSession:
             # np.add.at 支持重复索引累加，适合一帧点云内多个点落到同一格。
             np.add.at(self.occ_counts, (iy[occ], ix[occ]), 1)
             np.add.at(self.free_counts, (iy[free], ix[free]), 1)
+
+    def _expand_to_include(self, xyz: np.ndarray) -> None:
+        cfg = self.config
+        resolution = cfg.resolution
+        current_max_x = cfg.origin_x + self.width * resolution
+        current_max_y = cfg.origin_y + self.height * resolution
+        min_x = min(cfg.origin_x, float(np.min(xyz[:, 0])))
+        min_y = min(cfg.origin_y, float(np.min(xyz[:, 1])))
+        max_x = max(current_max_x, float(np.max(xyz[:, 0])) + resolution)
+        max_y = max(current_max_y, float(np.max(xyz[:, 1])) + resolution)
+        new_origin_x = np.floor(min_x / resolution) * resolution
+        new_origin_y = np.floor(min_y / resolution) * resolution
+        new_width = int(np.ceil((max_x - new_origin_x) / resolution))
+        new_height = int(np.ceil((max_y - new_origin_y) / resolution))
+        if (
+            new_width == self.width
+            and new_height == self.height
+            and np.isclose(new_origin_x, cfg.origin_x)
+            and np.isclose(new_origin_y, cfg.origin_y)
+        ):
+            return
+        x_offset = int(round((cfg.origin_x - new_origin_x) / resolution))
+        y_offset = int(round((cfg.origin_y - new_origin_y) / resolution))
+        old_slice = (
+            slice(y_offset, y_offset + self.height),
+            slice(x_offset, x_offset + self.width),
+        )
+        new_occ = np.zeros((new_height, new_width), dtype=np.uint32)
+        new_free = np.zeros((new_height, new_width), dtype=np.uint32)
+        new_occ[old_slice] = self.occ_counts
+        new_free[old_slice] = self.free_counts
+        self.occ_counts = new_occ
+        self.free_counts = new_free
+        if self.base_cells is not None:
+            new_base = np.full((new_height, new_width), -1, dtype=np.int8)
+            new_base[old_slice] = self.base_cells
+            self.base_cells = new_base
+        self.width = new_width
+        self.height = new_height
+        cfg.origin_x = float(new_origin_x)
+        cfg.origin_y = float(new_origin_y)
+        cfg.size_x = new_width * resolution
+        cfg.size_y = new_height * resolution
+
+    def set_map_from_cloud_transform(self, matrix: np.ndarray) -> None:
+        with self.lock:
+            if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+                raise ValueError("map-from-cloud transform must be a finite 4x4 matrix")
+            self.map_from_cloud = matrix.copy()
+
+    def _seed_from_parent_grid(self) -> None:
+        record_path = self.config.map_store_root / f"{self.base_map_id}.json"
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            grid = record["grid"]
+            width = int(grid["width"])
+            height = int(grid["height"])
+            data = np.asarray(grid["data"], dtype=np.int16).reshape(height, width)
+            resolution = float(grid["resolution"])
+            origin_x = float(grid.get("origin_x", 0.0))
+            origin_y = float(grid.get("origin_y", 0.0))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"failed to load parent 2D grid {self.base_map_id}: {exc}"
+            ) from exc
+        if width <= 0 or height <= 0 or resolution <= 0:
+            raise RuntimeError("parent 2D grid dimensions are invalid")
+        self.width = width
+        self.height = height
+        self.config.resolution = resolution
+        self.config.origin_x = origin_x
+        self.config.origin_y = origin_y
+        self.occ_counts = np.zeros((height, width), dtype=np.uint32)
+        self.free_counts = np.zeros((height, width), dtype=np.uint32)
+        self.base_cells = data.astype(np.int8, copy=True)
 
     def save(self, map_name: str | None = None) -> dict[str, Any]:
         with self.lock:
@@ -187,12 +311,15 @@ class MappingSession:
                 "width": self.width,
                 "height": self.height,
                 "last_error": self.last_error,
+                "session_id": self.session_id,
+                "base_map_id": self.base_map_id,
             }
 
     def _clear_counts(self) -> None:
         # 只清空累积证据，不改变地图参数。
         self.occ_counts.fill(0)
         self.free_counts.fill(0)
+        self.base_cells = None
 
     def _pgm_path(self) -> Path:
         return self.config.output_dir / f"{self.current_map_name}.pgm"
@@ -217,10 +344,37 @@ class MappingSession:
         executable = self._resolve_path(cfg.pcd2pgm_executable)
         config_path = self._resolve_path(cfg.pcd2pgm_config)
         pcd_input = self._resolve_path(cfg.pcd_input_path)
-        relocalization_pcd = self._resolve_path(cfg.relocalization_pcd_path)
-        output_dir = self._resolve_path(cfg.output_dir)
+        output_root = self._resolve_path(cfg.output_dir)
+        session_name = self.session_id or self.current_map_name
+        session_name = sanitize_map_name(session_name)
+        output_dir = output_root / ".staging" / session_name
+        relocalization_pcd = output_dir / "map.pcd"
         output_dir.mkdir(parents=True, exist_ok=True)
-        relocalization_pcd.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.base_map_id:
+            base_pcd = cfg.map_store_root / self.base_map_id / "map.pcd"
+            if not base_pcd.is_file():
+                raise FileNotFoundError(f"parent PCD not found: {base_pcd}")
+            merge_executable = self._resolve_path(cfg.pcd_merge_executable)
+            if not merge_executable.is_file():
+                raise FileNotFoundError(
+                    f"PCD merge executable not found: {merge_executable}")
+            merged_pcd = output_dir / "merged.pcd"
+            transform_csv = ",".join(
+                f"{value:.12g}" for value in self.map_from_cloud.reshape(-1)
+            )
+            self.command_runner(
+                [
+                    str(merge_executable),
+                    "--base", str(base_pcd),
+                    "--increment", str(pcd_input),
+                    "--output", str(merged_pcd),
+                    "--transform", transform_csv,
+                    "--leaf", "0.10",
+                ],
+                output_dir,
+            )
+            pcd_input = merged_pcd
 
         if not pcd_input.exists():
             raise FileNotFoundError(f"Point-LIO PCD not found: {pcd_input}")
@@ -282,8 +436,13 @@ class MappingSession:
         # Nav2/ROS PGM 约定：0 表示占用，254 表示空闲，205 通常作为未知灰度。
         occ = self.occ_counts > 0
         free = self.free_counts > 0
-        grid = np.full((self.height, self.width), 205, dtype=np.uint8)
-        grid[free] = 254
+        if self.base_cells is None:
+            grid = np.full((self.height, self.width), 205, dtype=np.uint8)
+        else:
+            grid = np.full(self.base_cells.shape, 205, dtype=np.uint8)
+            grid[(self.base_cells >= 0) & (self.base_cells < 65)] = 254
+            grid[self.base_cells >= 65] = 0
+        grid[free & (grid != 0)] = 254
         # 对障碍物做曼哈顿邻域膨胀，给导航避障留下安全边界。
         for _ in range(max(self.config.occupied_dilation, 0)):
             expanded = occ.copy()
@@ -429,6 +588,8 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
     from std_srvs.srv import SetBool, Trigger
+    from rclpy.time import Time
+    from tf2_ros import Buffer, TransformException, TransformListener
 
     class MappingControlNode(Node):
         """订阅 Point-LIO 点云，并提供 App 建图 action/service/topic。"""
@@ -441,6 +602,9 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             self.completed_build_result: dict[str, Any] | None = None
             self.build_done = threading.Event()
             self.build_lock = threading.RLock()
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+            self.last_tf_warning_at = 0.0
             cloud_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.BEST_EFFORT,
                 history=QoSHistoryPolicy.KEEP_LAST,
@@ -490,6 +654,26 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
         def on_cloud(self, msg: PointCloud2) -> None:
             # 将 ROS PointCloud2 转成 Nx3 numpy 数组，再交给纯 Python 状态逻辑处理。
             pts = point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"))
+            if session.base_map_id:
+                source_frame = msg.header.frame_id or "odom"
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        "map", source_frame, Time())
+                    t = transform.transform.translation
+                    q = transform.transform.rotation
+                    pts, matrix = apply_rigid_transform(
+                        pts,
+                        translation=(t.x, t.y, t.z),
+                        quaternion=(q.x, q.y, q.z, q.w),
+                    )
+                    session.set_map_from_cloud_transform(matrix)
+                except (TransformException, ValueError) as exc:
+                    now = time.monotonic()
+                    if now - self.last_tf_warning_at > 5.0:
+                        self.get_logger().warning(
+                            f"waiting for map<-{source_frame} transform: {exc}")
+                        self.last_tf_warning_at = now
+                    return
             session.ingest_xyz(pts)
 
         def on_build_goal(self, goal_request: BuildMap.Goal) -> GoalResponse:
@@ -521,14 +705,18 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             try:
                 self._call_point_lio_trigger(self.point_lio_start_client,
                     "start Point-LIO mapping accumulation")
-                session.start(goal_handle.request.map_name)
+                session.start(
+                    goal_handle.request.map_name,
+                    goal_handle.request.session_id,
+                    goal_handle.request.base_map_id,
+                )
             except Exception as exc:
                 session.last_error = str(exc)
                 self.get_logger().error(f"mapping build failed to start: {exc}")
                 goal_handle.abort()
                 self.publish_status()
                 self._clear_active_goal()
-                return self._build_action_result(False, str(exc), "", "")
+                return self._build_action_result(False, str(exc), "", "", "")
 
             self.publish_status()
             while rclpy.ok():
@@ -542,7 +730,8 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
                     session.cancel()
                     goal_handle.canceled()
                     self.publish_status()
-                    result = self._build_action_result(False, "mapping cancelled", "", "")
+                    result = self._build_action_result(
+                        False, "mapping cancelled", "", "", "")
                     self._clear_active_goal()
                     return result
 
@@ -556,6 +745,7 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
                         "map saved",
                         str(completed.get("map_pgm_path", "")),
                         str(completed.get("map_yaml_path", "")),
+                        str(completed.get("relocalization_pcd_path", "")),
                     )
                     self._clear_active_goal()
                     return result
@@ -566,7 +756,7 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
 
             goal_handle.abort()
             self._clear_active_goal()
-            return self._build_action_result(False, "rclpy shutdown", "", "")
+            return self._build_action_result(False, "rclpy shutdown", "", "", "")
 
         def on_pause(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
             # true 暂停累计，false 继续累计；Point-LIO 本体仍照常运行。
@@ -601,6 +791,7 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
                 response.message = "map saved"
                 response.map_pgm_path = str(result["map_pgm_path"])
                 response.map_yaml_path = str(result["map_yaml_path"])
+                response.map_pcd_path = str(result["relocalization_pcd_path"])
                 with self.build_lock:
                     self.completed_build_result = result
                     self.build_done.set()
@@ -610,6 +801,7 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
                 response.message = str(exc)
                 response.map_pgm_path = ""
                 response.map_yaml_path = ""
+                response.map_pcd_path = ""
                 self.get_logger().error(f"mapping save failed: {exc}")
             self.publish_status()
             return response
@@ -626,6 +818,8 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             status_msg.width = int(data["width"])
             status_msg.height = int(data["height"])
             status_msg.last_error = str(data["last_error"])
+            status_msg.session_id = str(data["session_id"])
+            status_msg.base_map_id = str(data["base_map_id"])
             self.status_pub.publish(status_msg)
             self.publish_live_map(str(data["state"]))
 
@@ -699,12 +893,14 @@ def run_ros(args: argparse.Namespace, session: MappingSession) -> None:
             message: str,
             pgm_path: str,
             yaml_path: str,
+            pcd_path: str,
         ) -> BuildMap.Result:
             result = BuildMap.Result()
             result.success = success
             result.message = message
             result.map_pgm_path = pgm_path
             result.map_yaml_path = yaml_path
+            result.map_pcd_path = pcd_path
             return result
 
         def _clear_active_goal(self) -> None:
@@ -749,6 +945,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pcd2pgm-executable", default="pcd2pgm_headless", type=Path)
     parser.add_argument("--pcd2pgm-config", default="scans_nav2_map.cfg", type=Path)
     parser.add_argument("--pcd-input-path", default="src/Point-LIO/PCD/scans.pcd", type=Path)
+    parser.add_argument("--map-store-root", default="/var/lib/bxi/maps", type=Path)
+    parser.add_argument("--pcd-merge-executable", default="merge_pcd_maps", type=Path)
     parser.add_argument(
         "--relocalization-pcd-path",
         default="maps/PCD/scans.pcd",
@@ -783,6 +981,8 @@ def main() -> None:
             pcd2pgm_config=args.pcd2pgm_config,
             pcd_input_path=args.pcd_input_path,
             relocalization_pcd_path=args.relocalization_pcd_path,
+            map_store_root=args.map_store_root,
+            pcd_merge_executable=args.pcd_merge_executable,
         )
     )
     if args.no_ros:
