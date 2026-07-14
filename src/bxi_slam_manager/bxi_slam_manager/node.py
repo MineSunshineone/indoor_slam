@@ -14,7 +14,6 @@ from rclpy.qos import (
     DurabilityPolicy,
     QoSProfile,
     ReliabilityPolicy,
-    qos_profile_sensor_data,
 )
 
 from .process_backend import RosLaunchBackend
@@ -28,6 +27,9 @@ _MODE_BY_VALUE = {
     SetRuntimeMode.Request.MODE_EXTEND_MAPPING: RuntimeMode.extend_mapping,
 }
 
+_LIDAR_HEALTH_TIMEOUT_S = 2.5
+_LIDAR_SUBSCRIPTION_REFRESH_S = 5.0
+
 
 class SlamManagerNode(Node):
     def __init__(self) -> None:
@@ -38,6 +40,8 @@ class SlamManagerNode(Node):
             localization_timeout_s=3.0,
         )
         self._last_lidar_at = 0.0
+        self._last_lidar_sub_refresh_at = time.monotonic()
+        self._last_driver_healthy: bool | None = None
         self._localization_epoch_ns = 0
         status_qos = QoSProfile(depth=1)
         status_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -45,23 +49,29 @@ class SlamManagerNode(Node):
         self._status_pub = self.create_publisher(
             RuntimeStatus, "/slam/runtime/status", status_qos
         )
-        self.create_service(
+        self._set_mode_srv = self.create_service(
             SetRuntimeMode, "/slam/runtime/set_mode", self._on_set_mode
         )
-        self.create_subscription(
+        self._relocalization_sub = self.create_subscription(
             RelocalizationStatus,
             "/nav/relocalization_status",
             self._on_relocalization_status,
             status_qos,
         )
-        self.create_subscription(
+        self._lidar_sub = self._create_lidar_subscription()
+        self._health_timer = self.create_timer(1.0, self._health_tick)
+        self._publish_status()
+
+    def _create_lidar_subscription(self):
+        lidar_qos = QoSProfile(depth=64)
+        lidar_qos.reliability = ReliabilityPolicy.RELIABLE
+        lidar_qos.durability = DurabilityPolicy.VOLATILE
+        return self.create_subscription(
             CustomMsg,
             "/livox/lidar",
             self._on_lidar,
-            qos_profile_sensor_data,
+            lidar_qos,
         )
-        self.create_timer(1.0, self._health_tick)
-        self._publish_status()
 
     def _on_set_mode(self, request, response):
         mode = _MODE_BY_VALUE.get(request.mode)
@@ -108,16 +118,40 @@ class SlamManagerNode(Node):
         self._publish_status()
 
     def _on_lidar(self, _msg: CustomMsg) -> None:
+        if self._last_lidar_at == 0.0:
+            self.get_logger().info("First Livox LiDAR frame received")
         self._last_lidar_at = time.monotonic()
 
     def _health_tick(self) -> None:
+        now = time.monotonic()
         healthy = (
             self._last_lidar_at > 0.0
-            and time.monotonic() - self._last_lidar_at < 2.5
+            and now - self._last_lidar_at < _LIDAR_HEALTH_TIMEOUT_S
         )
+        if healthy != self._last_driver_healthy:
+            self.get_logger().info(f"Livox LiDAR health changed: {healthy}")
+            self._last_driver_healthy = healthy
+        self._refresh_lidar_subscription_if_needed(now, healthy)
         self._runtime.update_driver_health(healthy)
         self._runtime.check_health()
         self._publish_status()
+
+    def _refresh_lidar_subscription_if_needed(self, now: float, healthy: bool) -> None:
+        if healthy:
+            return
+        if now - self._last_lidar_sub_refresh_at < _LIDAR_SUBSCRIPTION_REFRESH_S:
+            return
+        self._last_lidar_sub_refresh_at = now
+        self.get_logger().warning(
+            "Refreshing Livox LiDAR subscription after data timeout"
+        )
+        try:
+            self.destroy_subscription(self._lidar_sub)
+        except Exception as exc:  # pragma: no cover - defensive ROS cleanup
+            self.get_logger().warning(
+                f"Failed to destroy stale Livox LiDAR subscription: {exc}"
+            )
+        self._lidar_sub = self._create_lidar_subscription()
 
     def _publish_status(self) -> None:
         snapshot = self._runtime.snapshot

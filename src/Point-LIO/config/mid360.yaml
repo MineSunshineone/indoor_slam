@@ -45,6 +45,7 @@
             acc_cov_input: 0.1                              # for IMU as input model
             plane_thr: 0.1                                  # 0.05, the threshold for plane criteria, the smaller, the flatter a plane
             match_s: 70.0
+            det_range: 30.0                                 # Indoor range cap in meters; lowers map size and processing load
             ivox_grid_resolution: 0.5
             filter_rear_points: False                      # Drop the rear sector from map building and PCD saving
             rear_filter_angle_deg: 100.0                   # Total rear sector angle centered on -X in lidar/body frame
