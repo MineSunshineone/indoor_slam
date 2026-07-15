@@ -1,4 +1,9 @@
-from ament_index_python.packages import get_package_share_directory
+import os
+
+from ament_index_python.packages import (
+    get_package_prefix,
+    get_package_share_directory,
+)
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
@@ -8,6 +13,11 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     remappings = [("/tf", "tf"), ("/tf_static", "tf_static"), ("path", "/debug/path")]
+    indoor_root = os.environ.get("BXI_INDOOR_SLAM_ROOT", "/opt/bxi/indoor")
+    point_lio_source_dir = os.environ.get(
+        "BXI_POINT_LIO_SOURCE_DIR",
+        os.path.join(indoor_root, "src", "Point-LIO"),
+    )
 
     namespace = LaunchConfiguration("namespace")
     use_rviz = LaunchConfiguration("rviz")
@@ -25,6 +35,8 @@ def generate_launch_description():
     pcd2pgm_config = LaunchConfiguration("pcd2pgm_config")
     mapping_pcd_input_path = LaunchConfiguration("mapping_pcd_input_path")
     relocalization_pcd_path = LaunchConfiguration("relocalization_pcd_path")
+    map_store_root = LaunchConfiguration("map_store_root")
+    pcd_merge_executable = LaunchConfiguration("pcd_merge_executable")
 
     point_lio_dir = get_package_share_directory("point_lio")
 
@@ -53,7 +65,7 @@ def generate_launch_description():
     )
     declare_mapping_output_dir = DeclareLaunchArgument(
         "mapping_output_dir",
-        default_value="src/bxi_nav/maps",
+        default_value=os.path.join(indoor_root, "src", "bxi_nav", "maps"),
         description="Directory where saved .pgm and .yaml maps are written",
     )
     declare_mapping_resolution = DeclareLaunchArgument(
@@ -88,23 +100,35 @@ def generate_launch_description():
     )
     declare_pcd2pgm_executable = DeclareLaunchArgument(
         "pcd2pgm_executable",
-        default_value="pcd2pgm_headless",
+        default_value=os.path.join(indoor_root, "pcd2pgm_headless"),
         description="Executable used to convert Point-LIO PCD into Nav2 map files",
     )
     declare_pcd2pgm_config = DeclareLaunchArgument(
         "pcd2pgm_config",
-        default_value="scans_nav2_map.cfg",
+        default_value=os.path.join(indoor_root, "scans_nav2_map.cfg"),
         description="pcd2pgm_headless config file",
     )
     declare_mapping_pcd_input_path = DeclareLaunchArgument(
         "mapping_pcd_input_path",
-        default_value="src/Point-LIO/PCD/scans.pcd",
+        default_value=os.path.join(point_lio_source_dir, "PCD", "scans.pcd"),
         description="Point-LIO PCD file converted when /mapping/save is called",
     )
     declare_relocalization_pcd_path = DeclareLaunchArgument(
         "relocalization_pcd_path",
-        default_value="maps/PCD/scans.pcd",
+        default_value=os.path.join(indoor_root, "maps", "PCD", "scans.pcd"),
         description="Edited PCD output used by small_gicp relocalization",
+    )
+    declare_map_store_root = DeclareLaunchArgument(
+        "map_store_root",
+        default_value="/var/lib/bxi/maps",
+        description="Robot-side versioned map bundle root",
+    )
+    declare_pcd_merge_executable = DeclareLaunchArgument(
+        "pcd_merge_executable",
+        default_value=os.path.join(
+            get_package_prefix("point_lio"), "lib", "point_lio", "merge_pcd_maps"
+        ),
+        description="Executable that merges a parent PCD with an aligned increment",
     )
 
     start_point_lio_node = Node(
@@ -148,6 +172,10 @@ def generate_launch_description():
             mapping_pcd_input_path,
             "--relocalization-pcd-path",
             relocalization_pcd_path,
+            "--map-store-root",
+            map_store_root,
+            "--pcd-merge-executable",
+            pcd_merge_executable,
         ],
     )
 
@@ -183,6 +211,8 @@ def generate_launch_description():
             declare_pcd2pgm_config,
             declare_mapping_pcd_input_path,
             declare_relocalization_pcd_path,
+            declare_map_store_root,
+            declare_pcd_merge_executable,
             start_point_lio_node,
             start_mapping_control_node,
             start_rviz_node,

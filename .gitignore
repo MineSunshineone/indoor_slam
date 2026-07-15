@@ -11,3 +11,8 @@ compile_commands.json
 .clangd
 src/Point-LIO/PCD
 .omc/
+
+# Python bytecode/cache
+__pycache__/
+*.pyc
+*.py[cod]

@@ -6,3 +6,5 @@ float32 resolution
 uint32 width
 uint32 height
 string last_error
+string session_id
+string base_map_id

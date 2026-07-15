@@ -10,6 +10,7 @@ Indoor SLAM 是一套基于 ROS 2 Humble 的室内定位与导航工作区，当
 | Point-LIO | `src/Point-LIO` | 激光惯性里程计，输出机器人位姿和注册点云 |
 | small_gicp_relocalization | `src/small_gicp_relocalization` | 基于点云地图的重定位 |
 | Nav2 导航 | `src/bxi_nav` | 启动地图服务器、Nav2、点云转激光和 RViz |
+| 运行时主管 | `src/bxi_slam_manager` | 静默启动，并按 App 请求切换建图、3D 重定位、导航和续建模式 |
 | 自定义控制器 | `src/pid_path_follower` | Nav2 控制器插件 |
 | 地图工具 | `tools` | PCD 到 Nav2 栅格地图转换、地图清理脚本 |
 
@@ -61,14 +62,21 @@ source install/setup.bash
 
 ## 一键启动
 
-`start.sh` 会创建一个 `tmux` 会话，并按 4 个窗格启动完整系统：
+`start.sh` 只启动 Livox MID360 驱动和 `bxi_slam_manager`。系统开机后处于
+`idle` 静默模式，不加载历史地图，也不启动 Point-LIO、GICP、Nav2 或 RViz。
+App 发出运行模式请求后，主管才启动对应算法栈：
 
-| 窗格 | 模块 | 命令 |
-| --- | --- | --- |
-| 左上 | 雷达驱动 | `ros2 launch livox_ros_driver2 msg_MID360s_launch.py` |
-| 左下 | Point-LIO + 建图控制 | `ros2 launch point_lio point_lio_with_mapping_control.launch.py` |
-| 右上 | 重定位 | `ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py` |
-| 右下 | 导航 | `ros2 launch nav indoor_navigation_launch.py` |
+| 模式 | 行为 |
+| --- | --- |
+| `new_mapping` | 启动 Point-LIO 和实时 2D 栅格，边扫描边建图 |
+| `navigation` | 加载地图 bundle，启动 Point-LIO、3D GICP 和 Nav2；定位成功前禁止运动目标 |
+| `extend_mapping` | 在父地图 3D 重定位成功后续建，保存为不可变子版本 |
+| `idle` | 停止按需算法进程，Livox 驱动和主管保持在线 |
+
+主管每秒检查算法子进程与 3D 定位状态。GICP 状态超过 3 秒未更新或任一算法
+子进程异常退出时，系统会立即重新锁住导航并进入 `error`。按需进程组记录在
+`BXI_SLAM_PROCESS_REGISTRY` 指定的位置（root 默认
+`/run/bxi/slam-processes.json`），主管异常重启时会先清理旧进程组。
 
 启动：
 
@@ -79,7 +87,13 @@ source install/setup.bash
 `start.sh` 默认使用：
 
 ```bash
-ROS_DOMAIN_ID=37
+ROS_DOMAIN_ID=22
+```
+
+如需覆盖雷达配置：
+
+```bash
+LIVOX_CONFIG_PATH=/absolute/path/MID360.json ./start.sh
 ```
 
 停止：
@@ -97,7 +111,7 @@ ROS_DOMAIN_ID=37
 终端 1，雷达驱动：
 
 ```bash
-export ROS_DOMAIN_ID=37
+export ROS_DOMAIN_ID=22
 source install/setup.bash
 ros2 launch livox_ros_driver2 msg_MID360s_launch.py
 ```
@@ -105,7 +119,7 @@ ros2 launch livox_ros_driver2 msg_MID360s_launch.py
 终端 2，Point-LIO：
 
 ```bash
-export ROS_DOMAIN_ID=37
+export ROS_DOMAIN_ID=22
 source install/setup.bash
 ros2 launch point_lio point_lio.launch.py
 ```
@@ -113,7 +127,7 @@ ros2 launch point_lio point_lio.launch.py
 如果需要同时启动 App 建图控制接口，使用：
 
 ```bash
-export ROS_DOMAIN_ID=37
+export ROS_DOMAIN_ID=22
 source install/setup.bash
 ros2 launch point_lio point_lio_with_mapping_control.launch.py
 ```
@@ -121,7 +135,7 @@ ros2 launch point_lio point_lio_with_mapping_control.launch.py
 终端 3，重定位：
 
 ```bash
-export ROS_DOMAIN_ID=37
+export ROS_DOMAIN_ID=22
 source install/setup.bash
 ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py
 ```
@@ -129,7 +143,7 @@ ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py
 终端 4，导航：
 
 ```bash
-export ROS_DOMAIN_ID=37
+export ROS_DOMAIN_ID=22
 source install/setup.bash
 ros2 launch nav indoor_navigation_launch.py
 ```

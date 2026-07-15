@@ -71,7 +71,7 @@ def generate_launch_description():
                 # 机器人本体坐标系，用于把 /initialpose 转换成 map->odom 校正。
                 "robot_base_frame": "base_link",
                 # 雷达坐标系，与 base_frame 配合做先验地图坐标修正。
-                "lidar_frame": "base_raw",
+                "lidar_frame": "body_raw",
                 # 先验全局点云地图 PCD 文件路径。
                 "prior_pcd_file": prior_pcd_file,
                 # 输入 PointCloud2 话题，通常为 odom 空间下的注册点云。

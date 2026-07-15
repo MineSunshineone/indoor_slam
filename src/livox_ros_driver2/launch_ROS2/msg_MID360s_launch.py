@@ -1,8 +1,9 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-import launch
 
 ################### user configure parameters for ros2 start ###################
 xfer_format   = 1    # 0-Pointcloud2(PointXYZRTL), 1-customized pointcloud format
@@ -16,7 +17,7 @@ cmdline_bd_code = 'livox0000000001'
 
 cur_path = os.path.split(os.path.realpath(__file__))[0] + '/'
 cur_config_path = cur_path + '../config'
-user_config_path = os.path.join(cur_config_path, 'MID360s_config.json')
+default_user_config_path = os.path.join(cur_config_path, 'MID360s_config.json')
 ################### user configure parameters for ros2 end #####################
 
 livox_ros2_params = [
@@ -27,7 +28,7 @@ livox_ros2_params = [
     {"output_data_type": output_type},
     {"frame_id": frame_id},
     {"lvx_file_path": lvx_file_path},
-    {"user_config_path": user_config_path},
+    {"user_config_path": LaunchConfiguration("user_config_path")},
     {"cmdline_input_bd_code": cmdline_bd_code}
 ]
 
@@ -42,6 +43,11 @@ def generate_launch_description():
         )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "user_config_path",
+            default_value=default_user_config_path,
+            description="Livox JSON config path; override per robot deployment",
+        ),
         livox_driver,
         # launch.actions.RegisterEventHandler(
         #     event_handler=launch.event_handlers.OnProcessExit(

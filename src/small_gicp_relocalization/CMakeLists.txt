@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.11)
 project(small_gicp_relocalization)
 
-## Use C++14
-set(CMAKE_CXX_STANDARD 14)
+## Use C++17 for strongly typed runtime/status integration.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ## By adding -Wall and -Werror, the compiler does not ignore warnings anymore,

@@ -57,6 +57,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   has_global_map_msg_(false),
   last_published_reloc_required_(true),
   last_accepted_time_(0, 0, RCL_ROS_TIME),
+  last_fitness_score_(0.0),
+  last_inlier_ratio_(0.0),
+  last_translation_update_(0.0),
+  last_rotation_update_deg_(0.0),
   result_t_(Eigen::Isometry3d::Identity()),
   previous_result_t_(Eigen::Isometry3d::Identity())
 {
@@ -138,6 +142,9 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   // 中途重连的 WS 客户端也能在 1 秒内收敛。
   reloc_required_pub_ = this->create_publisher<std_msgs::msg::Bool>(
     "/nav/reloc_required", rclcpp::QoS(1).reliable().transient_local());
+  reloc_status_pub_ =
+    this->create_publisher<bxi_nav_interfaces::msg::RelocalizationStatus>(
+    "/nav/relocalization_status", rclcpp::QoS(1).reliable().transient_local());
 
   loadGlobalMap(prior_pcd_file_);
 
@@ -193,6 +200,16 @@ void SmallGicpRelocalizationNode::publishRelocState()
   std_msgs::msg::Bool msg;
   msg.data = required;
   reloc_required_pub_->publish(msg);
+
+  bxi_nav_interfaces::msg::RelocalizationStatus status;
+  status.header.stamp = this->now();
+  status.header.frame_id = map_frame_;
+  status.localized = !required;
+  status.fitness_score = static_cast<float>(last_fitness_score_);
+  status.inlier_ratio = static_cast<float>(last_inlier_ratio_);
+  status.translation_update = static_cast<float>(last_translation_update_);
+  status.rotation_update_deg = static_cast<float>(last_rotation_update_deg_);
+  reloc_status_pub_->publish(status);
 }
 
 void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
@@ -313,6 +330,10 @@ void SmallGicpRelocalizationNode::performRegistration()
   const Eigen::Isometry3d delta = previous_result_t_.inverse() * result.T_target_source;
   const double translation_update = delta.translation().norm();
   const double rotation_update = Eigen::AngleAxisd(delta.rotation()).angle();
+  last_fitness_score_ = fitness_score;
+  last_inlier_ratio_ = inlier_ratio;
+  last_translation_update_ = translation_update;
+  last_rotation_update_deg_ = rotation_update * 180.0 / std::acos(-1.0);
 
   if (!result.converged) {
     RCLCPP_WARN(this->get_logger(), "GICP did not converge.");

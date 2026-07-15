@@ -69,6 +69,9 @@ add_executable(pointlio_mapping
   src/IMU_Processing.cpp
 )
 
+add_executable(merge_pcd_maps src/merge_pcd_maps.cpp)
+target_link_libraries(merge_pcd_maps ${PCL_LIBRARIES})
+
 # ROS2 依赖
 ament_target_dependencies(pointlio_mapping
   rclcpp
@@ -95,6 +98,7 @@ target_link_libraries(pointlio_mapping ${ALL_LIBS})
 # 安装
 install(TARGETS
   pointlio_mapping
+  merge_pcd_maps
   DESTINATION lib/${PROJECT_NAME}
 )
 

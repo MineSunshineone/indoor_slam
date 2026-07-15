@@ -1,9 +1,12 @@
 string map_name
+string session_id
+string base_map_id
 ---
 bool success
 string message
 string map_pgm_path
 string map_yaml_path
+string map_pcd_path
 ---
 string state
 uint32 cells_known

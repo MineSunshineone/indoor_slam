@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include "bxi_nav_interfaces/msg/relocalization_status.hpp"
 #include "pcl/io/pcd_io.h"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
@@ -70,6 +71,10 @@ private:
   double localized_timeout_;
   bool last_published_reloc_required_;
   rclcpp::Time last_accepted_time_;
+  double last_fitness_score_;
+  double last_inlier_ratio_;
+  double last_translation_update_;
+  double last_rotation_update_deg_;
   std::vector<double> init_pose_;
 
   std::string map_frame_;
@@ -109,6 +114,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_scan_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_scan_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr reloc_required_pub_;
+  rclcpp::Publisher<bxi_nav_interfaces::msg::RelocalizationStatus>::SharedPtr
+    reloc_status_pub_;
   sensor_msgs::msg::PointCloud2 global_map_msg_;
 };
 
